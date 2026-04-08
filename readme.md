@@ -1,6 +1,6 @@
 # Mounty - Samba/CIFS Share Manager for KDE Plasma
 
-A CLI tool for **KDE Plasma** desktops (Kubuntu, KDE Neon, Fedora KDE, etc.) that mounts Samba shares using kernel CIFS instead of GVFS. Replaces the unreliable `smb://` handling in Dolphin with stable, real filesystem mounts that behave like Windows mapped network drives.
+A CLI tool for **KDE Plasma** desktops (Kubuntu, KDE Neon, Fedora KDE, etc.) that mounts Samba shares using kernel CIFS. Mounts behave like Windows mapped network drives — real filesystem paths visible to all applications.
 
 Passwords are stored in **KDE Wallet** — live credentials exist only in RAM (tmpfs), never on disk.
 
@@ -177,12 +177,6 @@ systemctl --user status mounty-unlock.service
 
 Open `~/mnt/<name>` in Dolphin, then right-click the folder in the sidebar and select **Add to Places**. The share now appears as a bookmark like a normal folder.
 
-## Why not smb:// in Dolphin?
+## smb:// vs kernel CIFS
 
-Dolphin's built-in `smb://` mounts use KIO/GVFS which:
-- Randomly disconnects
-- Is invisible to many applications (IDEs, CLI tools, containers)
-- Has poor performance
-- Causes authentication issues with multiple credentials
-
-Kernel CIFS mounts behave like real filesystems and work with everything — Dolphin, Konsole, IDEs, scripts, and containers.
+Dolphin's `smb://` mounts use KIO, which works well for casual file browsing. Kernel CIFS mounts via mounty are an alternative that provides real filesystem paths accessible to all applications — Dolphin, Konsole, IDEs, scripts, and containers.
