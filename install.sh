@@ -34,5 +34,29 @@ mkdir -p "$HOME/.mounty"
 mkdir -p "$HOME/mnt"
 echo "Created ~/.mounty and ~/mnt directories"
 
+# Install systemd user service for auto-unlock at login
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+SERVICE_FILE="$SYSTEMD_USER_DIR/mounty-unlock.service"
+mkdir -p "$SYSTEMD_USER_DIR"
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Mounty - unlock SMB credentials from KDE Wallet
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mounty unlock
+RemainAfterExit=yes
+ExecStop=%h/.local/bin/mounty lock
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable mounty-unlock.service
+echo "Installed and enabled mounty-unlock.service (auto-unlock at login)"
+
 echo "---"
 echo "Done. Run 'mounty help' to get started."

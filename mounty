@@ -3,13 +3,17 @@ set -euo pipefail
 
 # Mounty - User-friendly CIFS mount manager for Linux
 # Uses kernel CIFS mounts instead of GVFS for reliability
+# Passwords stored in KDE Wallet, live credentials in tmpfs (RAM only)
 
 CRED_DIR="$HOME/.mounty"
+LIVE_DIR="$HOME/.mounty/live"
 MNT_DIR="$HOME/mnt"
 FSTAB="/etc/fstab"
 FSTAB_MARKER="mounty"
 FSTAB_BEGIN="# >>> mounty managed mounts - do not edit manually >>>"
 FSTAB_END="# <<< mounty managed mounts <<<"
+KWALLET_FOLDER="mounty"
+KWALLET_NAME="kdewallet"
 
 # --- Output helpers ---
 
@@ -17,7 +21,7 @@ die() { echo "error: $*" >&2; exit 1; }
 info() { echo ":: $*"; }
 warn() { echo "warning: $*" >&2; }
 
-# --- Dependency check ---
+# --- Dependency checks ---
 
 ensure_deps() {
     if ! command -v mount.cifs &>/dev/null; then
@@ -40,6 +44,12 @@ ensure_smbclient() {
         else
             die "smbclient is required for browsing"
         fi
+    fi
+}
+
+ensure_kwallet() {
+    if ! command -v kwallet-query &>/dev/null; then
+        die "kwallet-query not found. Install kwalletmanager: sudo apt install kwalletmanager"
     fi
 }
 
@@ -80,6 +90,81 @@ detect_smb_version() {
         NT1)      echo "1.0" ;;
         *)        echo "" ;;
     esac
+}
+
+# --- KDE Wallet operations ---
+
+kwallet_store() {
+    local name="$1" password="$2"
+    ensure_kwallet
+    local result
+    result=$(echo -n "$password" | kwallet-query -w "cred-$name" -f "$KWALLET_FOLDER" "$KWALLET_NAME" 2>&1) || true
+    if [[ "$result" == *"does not exist"* ]]; then
+        die "failed to store password in KDE Wallet. Open KWallet Manager and ensure '$KWALLET_NAME' is open, then retry."
+    fi
+}
+
+kwallet_read() {
+    local name="$1"
+    ensure_kwallet
+    local result
+    result=$(kwallet-query -r "cred-$name" -f "$KWALLET_FOLDER" "$KWALLET_NAME" 2>/dev/null) || true
+    # kwallet-query prints errors to stdout — filter them out
+    if [[ "$result" == *"does not exist"* || -z "$result" ]]; then
+        echo ""
+    else
+        echo "$result"
+    fi
+}
+
+kwallet_remove() {
+    local name="$1"
+    ensure_kwallet
+    # kwallet-query has no delete, use qdbus
+    qdbus org.kde.kwalletd6 /modules/kwalletd6 removeEntry \
+        "$(qdbus org.kde.kwalletd6 /modules/kwalletd6 open "$KWALLET_NAME" 0 "mounty")" \
+        "$KWALLET_FOLDER" "cred-$name" "mounty" 2>/dev/null || true
+}
+
+# --- Live credential (tmpfs) operations ---
+
+is_unlocked() {
+    mountpoint -q "$LIVE_DIR" 2>/dev/null
+}
+
+require_unlocked() {
+    is_unlocked || die "mounty is locked. Run: mounty unlock"
+}
+
+# Write a live credential file (in tmpfs) for a share.
+# If password is passed as $2, use it directly; otherwise read from wallet.
+write_live_cred() {
+    local name="$1"
+    local pass_override="${2:-}"
+    local cred_file="$CRED_DIR/cred-$name"
+    [[ -f "$cred_file" ]] || return 1
+
+    local username domain password
+    username=$(grep '^username=' "$cred_file" | cut -d= -f2-)
+    domain=$(grep '^domain=' "$cred_file" | cut -d= -f2-)
+
+    if [[ -n "$pass_override" ]]; then
+        password="$pass_override"
+    else
+        password=$(kwallet_read "$name")
+    fi
+
+    if [[ -z "$password" ]]; then
+        warn "no password available for '$name'"
+        return 1
+    fi
+
+    cat > "$LIVE_DIR/cred-$name" <<EOF
+username=${username}
+password=${password}
+domain=${domain}
+EOF
+    chmod 600 "$LIVE_DIR/cred-$name"
 }
 
 share_exists() {
@@ -145,7 +230,6 @@ fstab_ensure_section() {
 }
 
 fstab_section_is_empty() {
-    # Check if there are any non-comment, non-blank lines between the markers
     local content
     content=$(sudo sed -n "/^${FSTAB_BEGIN}$/,/^${FSTAB_END}$/p" "$FSTAB" | grep -v "^#" | grep -v "^$" || true)
     [[ -z "$content" ]]
@@ -153,13 +237,12 @@ fstab_section_is_empty() {
 
 fstab_remove_section() {
     sudo sed -i "/^${FSTAB_BEGIN}$/,/^${FSTAB_END}$/d" "$FSTAB"
-    # Remove trailing blank lines left behind
     sudo sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$FSTAB"
 }
 
 fstab_add() {
     local name="$1" server="$2" share="$3" vers="$4"
-    local cred_file="$CRED_DIR/cred-$name"
+    local cred_file="$LIVE_DIR/cred-$name"
     local mnt_point="$MNT_DIR/$name"
     local uid gid
     uid=$(id -u)
@@ -170,7 +253,6 @@ fstab_add() {
 
     fstab_backup
     fstab_ensure_section
-    # Insert entry before the END marker
     sudo sed -i "/^${FSTAB_END}$/i ${entry}" "$FSTAB"
     info "fstab entry added"
 }
@@ -181,7 +263,6 @@ fstab_remove() {
         fstab_backup
         sudo sed -i "/# ${FSTAB_MARKER}:${name}$/d" "$FSTAB"
         info "fstab entry removed"
-        # Clean up section if no entries remain
         if fstab_section_is_empty; then
             fstab_remove_section
             info "fstab section removed (no shares left)"
@@ -191,12 +272,58 @@ fstab_remove() {
 
 # --- Commands ---
 
+cmd_unlock() {
+    if is_unlocked; then
+        info "already unlocked"
+        return
+    fi
+
+    ensure_kwallet
+    mkdir -p "$LIVE_DIR"
+    sudo mount -t tmpfs -o size=1M,mode=700,uid="$(id -u)",gid="$(id -g)" tmpfs "$LIVE_DIR"
+    info "tmpfs mounted at $LIVE_DIR"
+
+    # Populate live credentials from wallet
+    local shares count=0
+    shares=$(list_shares)
+    if [[ -n "$shares" ]]; then
+        while IFS= read -r name; do
+            if write_live_cred "$name"; then
+                (( count++ ))
+            fi
+        done <<< "$shares"
+    fi
+    info "$count share credential(s) loaded from KDE Wallet"
+}
+
+cmd_lock() {
+    # Unmount all shares first
+    local shares
+    shares=$(list_shares)
+    if [[ -n "$shares" ]]; then
+        while IFS= read -r name; do
+            if is_mounted "$name"; then
+                sudo umount "$MNT_DIR/$name" 2>/dev/null || warn "could not unmount $name"
+            fi
+            automount_stop "$name"
+        done <<< "$shares"
+    fi
+
+    if is_unlocked; then
+        sudo umount "$LIVE_DIR"
+        info "tmpfs unmounted — credentials cleared from RAM"
+    else
+        info "already locked"
+    fi
+}
+
 cmd_add() {
     local name="${1:-}"
     [[ -z "$name" ]] && die "usage: mounty add <name>"
     share_exists "$name" && die "share '$name' already exists. Use 'mounty edit $name' or 'mounty remove $name' first"
 
     ensure_deps
+    ensure_kwallet
 
     echo "Adding share: $name"
     echo "---"
@@ -228,22 +355,29 @@ cmd_add() {
         warn "could not detect SMB version, defaulting to $vers"
     fi
 
-    # Create credential file
+    # Store password in KDE Wallet
+    kwallet_store "$name" "$password"
+    info "password stored in KDE Wallet"
+
+    # Create permanent credential file (no password)
     mkdir -p "$CRED_DIR"
     local cred_file="$CRED_DIR/cred-$name"
     cat > "$cred_file" <<EOF
 username=${username}
-password=${password}
 domain=${domain}
 EOF
     chmod 600 "$cred_file"
-    info "credentials saved to $cred_file"
+    info "credentials saved to $cred_file (password in wallet only)"
 
     # Create mount point
     mkdir -p "$MNT_DIR/$name"
     info "mount point created at $MNT_DIR/$name"
 
-    # Add fstab entry and start automount
+    # Write live credential and add fstab entry
+    if ! is_unlocked; then
+        cmd_unlock
+    fi
+    write_live_cred "$name" "$password"
     fstab_add "$name" "$server" "$share" "$vers"
     automount_start "$name"
 
@@ -267,7 +401,14 @@ cmd_remove() {
     # Remove fstab entry
     fstab_remove "$name"
 
-    # Remove credential file
+    # Remove live credential
+    rm -f "$LIVE_DIR/cred-$name"
+
+    # Remove password from wallet
+    kwallet_remove "$name"
+    info "password removed from KDE Wallet"
+
+    # Remove permanent credential file
     rm -f "$CRED_DIR/cred-$name"
     info "credentials removed"
 
@@ -295,6 +436,7 @@ cmd_mount() {
 
     [[ -z "$name" ]] && die "usage: mounty mount <name|--all>"
     require_share "$name"
+    require_unlocked
 
     if is_mounted "$name"; then
         info "'$name' is already mounted"
@@ -340,6 +482,11 @@ cmd_list() {
         return
     fi
 
+    local locked_icon=""
+    is_unlocked && locked_icon="unlocked" || locked_icon="LOCKED"
+    echo "Vault: $locked_icon"
+    echo
+
     printf "%-20s %-10s %s\n" "NAME" "STATUS" "MOUNT POINT"
     printf "%-20s %-10s %s\n" "----" "------" "-----------"
 
@@ -354,10 +501,13 @@ cmd_status() {
     local name="${1:-}"
 
     if [[ -z "$name" ]]; then
-        # Show all shares
         local shares
         shares=$(list_shares)
         [[ -z "$shares" ]] && { echo "No shares configured."; return; }
+
+        echo "Vault: $(is_unlocked && echo "unlocked (tmpfs at $LIVE_DIR)" || echo "LOCKED")"
+        echo
+
         while IFS= read -r s; do
             cmd_status "$s"
             echo
@@ -373,9 +523,10 @@ cmd_status() {
 
     echo "Share: $name"
     echo "  Mount point:  $MNT_DIR/$name"
-    echo "  Credentials:  $cred_file"
+    echo "  Config:       $cred_file"
+    echo "  Live creds:   $LIVE_DIR/cred-$name $([ -f "$LIVE_DIR/cred-$name" ] && echo "(ready)" || echo "(missing)")"
+    echo "  Wallet:       $KWALLET_FOLDER/cred-$name"
 
-    # Extract server/share from fstab
     if [[ -n "$fstab_line" ]]; then
         local remote
         remote=$(echo "$fstab_line" | awk '{print $1}')
@@ -389,7 +540,6 @@ cmd_status() {
         echo "  fstab:        NOT CONFIGURED (missing entry)"
     fi
 
-    # Show credential info (without password)
     if [[ -f "$cred_file" ]]; then
         local user domain
         user=$(grep '^username=' "$cred_file" | cut -d= -f2-)
@@ -409,13 +559,13 @@ cmd_edit() {
     [[ -z "$name" ]] && die "usage: mounty edit <name>"
     require_share "$name"
 
+    ensure_kwallet
     local cred_file="$CRED_DIR/cred-$name"
 
     echo "Editing share: $name"
     echo "Leave blank to keep current value."
     echo "---"
 
-    # Read current values
     local cur_user cur_domain cur_server cur_share cur_vers
     cur_user=$(grep '^username=' "$cred_file" | cut -d= -f2-)
     cur_domain=$(grep '^domain=' "$cred_file" | cut -d= -f2-)
@@ -451,7 +601,8 @@ cmd_edit() {
     read -rsp "Password [unchanged]: " password
     echo
     if [[ -z "$password" ]]; then
-        password=$(grep '^password=' "$cred_file" | cut -d= -f2-)
+        password=$(kwallet_read "$name")
+        [[ -z "$password" ]] && die "no existing password in wallet and none provided"
     fi
 
     # Re-detect SMB version
@@ -466,23 +617,22 @@ cmd_edit() {
         warn "could not detect SMB version, keeping $vers"
     fi
 
-    # Was mounted?
-    local was_mounted=false
-    is_mounted "$name" && was_mounted=true
+    # Update wallet
+    kwallet_store "$name" "$password"
+    info "password updated in KDE Wallet"
 
-    # Unmount if needed
-    if $was_mounted; then
-        sudo umount "$MNT_DIR/$name" 2>/dev/null || true
-    fi
-
-    # Update credential file
+    # Update permanent credential file (no password)
     cat > "$cred_file" <<EOF
 username=${username}
-password=${password}
 domain=${domain}
 EOF
     chmod 600 "$cred_file"
     info "credentials updated"
+
+    # Rebuild live credential
+    if is_unlocked; then
+        write_live_cred "$name" "$password"
+    fi
 
     # Update fstab and restart automount
     automount_stop "$name"
@@ -497,6 +647,7 @@ cmd_browse() {
     [[ -z "$server" ]] && die "usage: mounty browse <server>"
 
     ensure_smbclient
+    ensure_kwallet
 
     # Ask for credentials (optional for anonymous access)
     local username="" password="" domain="WORKGROUP" auth_args=()
@@ -516,7 +667,6 @@ cmd_browse() {
 
     local raw_output
     if ! raw_output=$(smbclient -L "//$server" "${auth_args[@]}" -d 4 2>&1); then
-        # smbclient may return non-zero but still list shares — check for output
         if ! echo "$raw_output" | grep -q "Disk\|IPC\|Printer"; then
             echo "$raw_output" >&2
             die "could not connect to $server"
@@ -541,19 +691,17 @@ cmd_browse() {
         warn "could not detect SMB version, defaulting to $vers"
     fi
 
-    # Parse share list: lines matching "sharename   Disk|Printer   comment"
+    # Parse share list
     local -a share_names=()
     local -a share_types=()
     local -a share_comments=()
 
     while IFS= read -r line; do
-        # smbclient output format: "\tShareName      Type      Comment"
         local name type comment
         name=$(echo "$line" | awk '{print $1}')
         type=$(echo "$line" | awk '{print $2}')
         comment=$(echo "$line" | sed 's/^[[:space:]]*[^[:space:]]*[[:space:]]*[^[:space:]]*[[:space:]]*//')
 
-        # Skip IPC$ and hidden shares (ending with $) unless they're the only ones
         if [[ "$type" == "Disk" ]]; then
             share_names+=("$name")
             share_types+=("$type")
@@ -608,22 +756,29 @@ cmd_browse() {
 
     ensure_deps
 
-    # Create credential file
+    # Store password in KDE Wallet
+    kwallet_store "$mount_name" "$password"
+    info "password stored in KDE Wallet"
+
+    # Create permanent credential file (no password)
     mkdir -p "$CRED_DIR"
     local cred_file="$CRED_DIR/cred-$mount_name"
     cat > "$cred_file" <<EOF
 username=${username}
-password=${password}
 domain=${domain}
 EOF
     chmod 600 "$cred_file"
-    info "credentials saved to $cred_file"
+    info "credentials saved to $cred_file (password in wallet only)"
 
     # Create mount point
     mkdir -p "$MNT_DIR/$mount_name"
     info "mount point created at $MNT_DIR/$mount_name"
 
-    # Add fstab entry and start automount
+    # Write live credential and add fstab entry
+    if ! is_unlocked; then
+        cmd_unlock
+    fi
+    write_live_cred "$mount_name" "$password"
     fstab_add "$mount_name" "$server" "$selected_share" "$vers"
     automount_start "$mount_name"
 
@@ -636,6 +791,8 @@ cmd_help() {
 mounty - Samba/CIFS share manager
 
 Usage:
+  mounty unlock              Load passwords from KDE Wallet into RAM
+  mounty lock                Clear credentials from RAM, unmount all
   mounty add <name>          Add a new share (interactive)
   mounty browse <server>     Browse available shares on a server
   mounty remove <name>       Remove a share and clean up
@@ -646,8 +803,10 @@ Usage:
   mounty edit <name>         Edit share configuration
   mounty help                Show this help
 
+Passwords are stored in KDE Wallet. Live credentials are held in
+a tmpfs (RAM) at ~/.mounty/live/ — nothing touches disk.
+
 Shares are mounted at ~/mnt/<name> using kernel CIFS.
-Credentials are stored in ~/.mounty/cred-<name>.
 EOF
 }
 
@@ -658,6 +817,8 @@ main() {
     shift 2>/dev/null || true
 
     case "$cmd" in
+        unlock)  cmd_unlock "$@" ;;
+        lock)    cmd_lock "$@" ;;
         add)     cmd_add "$@" ;;
         browse)  cmd_browse "$@" ;;
         remove|rm)  cmd_remove "$@" ;;

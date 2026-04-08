@@ -1,9 +1,16 @@
-# Mounty - Samba/CIFS Share Manager
+# Mounty - Samba/CIFS Share Manager for KDE Plasma
 
-A CLI tool for mounting Samba shares on Linux using kernel CIFS instead of GVFS.
-Avoids the common issues with `smb://` mounts in Dolphin (disconnects, apps not seeing paths, poor performance).
+A CLI tool for **KDE Plasma** desktops (Kubuntu, KDE Neon, Fedora KDE, etc.) that mounts Samba shares using kernel CIFS instead of GVFS. Replaces the unreliable `smb://` handling in Dolphin with stable, real filesystem mounts that behave like Windows mapped network drives.
 
-Shares behave like Windows mapped network drives — stable, visible to all apps, independent credentials per mount.
+Passwords are stored in **KDE Wallet** — live credentials exist only in RAM (tmpfs), never on disk.
+
+## Requirements
+
+- KDE Plasma desktop (for KDE Wallet integration)
+- `cifs-utils` (installed automatically)
+- `smbclient` (installed automatically when using `browse`)
+- `kwalletmanager` / `kwallet-query` (ships with KDE Plasma)
+- systemd
 
 ## Install
 
@@ -11,22 +18,33 @@ Shares behave like Windows mapped network drives — stable, visible to all apps
 ./install.sh
 ```
 
-This installs the `mounty` command to `~/.local/bin/`, installs `cifs-utils`, and creates the required directories.
+This installs the `mounty` command to `~/.local/bin/`, installs `cifs-utils`, creates the required directories, and enables a systemd user service for auto-unlock at login.
+
+## How it works
+
+```
+~/.mounty/
+  cred-<name>        # username + domain only (no password)
+  live/              # tmpfs (RAM) — full credentials with passwords
+    cred-<name>      # written from KDE Wallet on unlock, gone on lock/reboot
+
+KDE Wallet
+  mounty/cred-<name> # passwords stored here
+```
+
+1. `mounty unlock` mounts a tmpfs at `~/.mounty/live/` and populates credential files from KDE Wallet
+2. fstab entries point to `~/.mounty/live/cred-<name>` — only works while unlocked
+3. `mounty lock` unmounts the tmpfs — all passwords vanish from RAM
+4. On reboot, the tmpfs is gone — run `mounty unlock` again (or automate at login)
 
 ## Usage
 
-### Add a share
+### Unlock / Lock
 
 ```bash
-mounty add nas
+mounty unlock    # load passwords from KDE Wallet into RAM
+mounty lock      # unmount all shares, clear credentials from RAM
 ```
-
-Interactive prompts ask for server, share name, username, password, domain, and SMB version.
-
-This creates:
-- Credential file at `~/.mounty/cred-nas` (mode 600)
-- Mount point at `~/mnt/nas`
-- fstab entry with `x-systemd.automount` (auto-mounts on access)
 
 ### Browse a server
 
@@ -34,10 +52,11 @@ This creates:
 mounty browse 192.168.1.10
 ```
 
-Connects to the server (with optional credentials), lists available shares, and lets you pick one to add:
+Connects to the server, lists available shares, and lets you pick one to add:
 
 ```
 :: browsing //192.168.1.10 ...
+:: negotiated SMB 3.1.1
 
   #    SHARE                          COMMENT
   --   -----                          -------
@@ -47,10 +66,18 @@ Connects to the server (with optional credentials), lists available shares, and 
 
 Select share to add [1-3, or q to quit]: 1
 :: selected: Data
-Mount name [data]:
+:: password stored in KDE Wallet
 ```
 
-After selecting, it reuses your browse credentials and sets up the share — same result as `mounty add`.
+The SMB protocol version is detected automatically from the server negotiation.
+
+### Add a share manually
+
+```bash
+mounty add nas
+```
+
+Interactive prompts ask for server, share name, username, and password. The password goes straight to KDE Wallet.
 
 ### Mount / Unmount
 
@@ -70,6 +97,8 @@ mounty list
 ```
 
 ```
+Vault: unlocked
+
 NAME                 STATUS     MOUNT POINT
 ----                 ------     -----------
 nas                  mounted    /home/user/mnt/nas
@@ -85,7 +114,9 @@ mounty status nas
 ```
 Share: nas
   Mount point:  /home/user/mnt/nas
-  Credentials:  /home/user/.mounty/cred-nas
+  Config:       /home/user/.mounty/cred-nas
+  Live creds:   /home/user/.mounty/live/cred-nas (ready)
+  Wallet:       mounty/cred-nas
   Remote:       //192.168.1.10/data
   SMB version:  3.1.1
   User:         NAS\user1
@@ -98,7 +129,7 @@ Share: nas
 mounty edit nas
 ```
 
-Re-prompts for all fields, keeping current values as defaults. Updates credentials and fstab entry.
+Re-prompts for all fields, keeping current values as defaults. Password is read from KDE Wallet if unchanged.
 
 ### Remove a share
 
@@ -106,55 +137,52 @@ Re-prompts for all fields, keeping current values as defaults. Updates credentia
 mounty remove nas
 ```
 
-Unmounts, removes the fstab entry, credential file, and mount point.
+Unmounts, removes the fstab entry, credential files, wallet entry, and mount point.
 
-## File layout
+## fstab
 
-```
-~/.mounty/
-  cred-<name>        # credential files (chmod 600)
-
-~/mnt/
-  <name>/            # mount points
-
-/etc/fstab           # entries inside a managed section
-```
-
-All fstab entries are kept inside a clearly marked section:
+All entries are managed inside a marked section:
 
 ```
 # >>> mounty managed mounts - do not edit manually >>>
-//nas/data /home/user/mnt/nas cifs credentials=... # mounty:nas
-//server/projects /home/user/mnt/office cifs credentials=... # mounty:office
+//nas/data /home/user/mnt/nas cifs credentials=/home/user/.mounty/live/cred-nas,... # mounty:nas
 # <<< mounty managed mounts <<<
 ```
 
-The section is created automatically on first `mounty add` and removed when the last share is deleted.
+The section is created on first `mounty add` and removed when the last share is deleted.
 
 ## Mount options
 
-Each share is configured with these defaults:
-
 | Option | Purpose |
 |--------|---------|
-| `credentials=` | Per-share credential file |
-| `vers=3.1.1` | Modern SMB protocol version |
+| `credentials=` | Points to live (tmpfs) credential file |
+| `vers=` | Auto-detected SMB version |
 | `uid/gid` | Local file ownership |
 | `_netdev` | Wait for network before mounting |
 | `x-systemd.automount` | Mount on first access |
 | `x-systemd.idle-timeout=5min` | Unmount when idle |
 | `nofail` | Boot even if server is unavailable |
 
+## Auto-unlock at login
+
+The installer sets up a systemd user service (`mounty-unlock.service`) that automatically runs `mounty unlock` when you log into your KDE Plasma session, and `mounty lock` on logout. KDE Wallet is already unlocked via PAM at that point, so the credentials flow seamlessly.
+
+To check the service status:
+
+```bash
+systemctl --user status mounty-unlock.service
+```
+
 ## Dolphin integration
 
 Open `~/mnt/<name>` in Dolphin, then right-click the folder in the sidebar and select **Add to Places**. The share now appears as a bookmark like a normal folder.
 
-## Why not smb:// ?
+## Why not smb:// in Dolphin?
 
-`smb://` URIs use GVFS which:
+Dolphin's built-in `smb://` mounts use KIO/GVFS which:
 - Randomly disconnects
 - Is invisible to many applications (IDEs, CLI tools, containers)
 - Has poor performance
-- Causes authentication issues
+- Causes authentication issues with multiple credentials
 
-Kernel CIFS mounts behave like real filesystems and work with everything.
+Kernel CIFS mounts behave like real filesystems and work with everything — Dolphin, Konsole, IDEs, scripts, and containers.
