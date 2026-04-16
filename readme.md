@@ -9,7 +9,7 @@ Passwords are stored in **KDE Wallet** — live credentials exist only in RAM (t
 - KDE Plasma desktop (for KDE Wallet integration)
 - `cifs-utils` (installed automatically)
 - `smbclient` (installed automatically when using `browse`)
-- `kwalletmanager` / `kwallet-query` (ships with KDE Plasma)
+- `dbus-send` (ships with dbus, present on virtually all Linux desktops)
 - systemd
 
 ## Install
@@ -18,7 +18,15 @@ Passwords are stored in **KDE Wallet** — live credentials exist only in RAM (t
 ./install.sh
 ```
 
-This installs the `mounty` command to `~/.local/bin/`, installs `cifs-utils`, creates the required directories, and enables a systemd user service for auto-unlock at login.
+This installs the `mounty` command to `~/.local/bin/`, installs `cifs-utils`, creates the required directories, enables a systemd user service for auto-unlock at login, and installs a NetworkManager dispatcher for automatic recovery after VPN/network changes.
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
+This removes all configured shares, the systemd service, the NetworkManager dispatcher, the mounty binary, and credential storage. `cifs-utils` is left installed.
 
 ## How it works
 
@@ -139,6 +147,21 @@ mounty remove nas
 
 Unmounts, removes the fstab entry, credential files, wallet entry, and mount point.
 
+### Recover after VPN / network changes
+
+```bash
+mounty reconnect
+```
+
+Resets failed automount units, unlocks the vault if locked, and lazy-unmounts stale mounts. Run this if shares stop working after a VPN connect/disconnect cycle.
+
+With the NetworkManager dispatcher installed (done automatically by `install.sh`), this happens automatically on network changes. To manage the dispatcher manually:
+
+```bash
+mounty install-dispatcher    # install auto-recovery hook
+mounty remove-dispatcher     # remove it
+```
+
 ## fstab
 
 All entries are managed inside a marked section:
@@ -158,6 +181,8 @@ The section is created on first `mounty add` and removed when the last share is 
 | `credentials=` | Points to live (tmpfs) credential file |
 | `vers=` | Auto-detected SMB version |
 | `uid/gid` | Local file ownership |
+| `file_mode=0644` | File permissions for proper application access |
+| `dir_mode=0755` | Directory permissions for proper application access |
 | `_netdev` | Wait for network before mounting |
 | `x-systemd.automount` | Mount on first access |
 | `x-systemd.idle-timeout=5min` | Unmount when idle |

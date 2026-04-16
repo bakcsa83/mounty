@@ -58,5 +58,9 @@ systemctl --user daemon-reload
 systemctl --user enable mounty-unlock.service
 echo "Installed and enabled mounty-unlock.service (auto-unlock at login)"
 
+# Install NetworkManager dispatcher for auto-recovery after VPN/network changes
+"$INSTALL_DIR/mounty" install-dispatcher
+echo "Installed NetworkManager dispatcher for automount recovery"
+
 echo "---"
 echo "Done. Run 'mounty help' to get started."

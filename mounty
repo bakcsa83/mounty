@@ -48,8 +48,8 @@ ensure_smbclient() {
 }
 
 ensure_kwallet() {
-    if ! command -v kwallet-query &>/dev/null; then
-        die "kwallet-query not found. Install kwalletmanager: sudo apt install kwalletmanager"
+    if ! command -v dbus-send &>/dev/null; then
+        die "dbus-send not found. Install dbus: sudo apt install dbus"
     fi
 }
 
@@ -94,36 +94,68 @@ detect_smb_version() {
 
 # --- KDE Wallet operations ---
 
+KWALLET_DBUS_DEST="org.kde.kwalletd6"
+KWALLET_DBUS_PATH="/modules/kwalletd6"
+KWALLET_DBUS_IFACE="org.kde.KWallet"
+KWALLET_APP_ID="mounty"
+
+kwallet_open() {
+    local handle
+    handle=$(dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
+        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.open" \
+        string:"$KWALLET_NAME" int64:0 string:"$KWALLET_APP_ID" 2>/dev/null \
+        | grep int32 | awk '{print $2}')
+    if [[ -z "$handle" || "$handle" == "-1" ]]; then
+        die "failed to open KDE Wallet. Ensure '$KWALLET_NAME' is open."
+    fi
+    echo "$handle"
+}
+
+kwallet_ensure_folder() {
+    local handle="$1"
+    dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
+        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.createFolder" \
+        int32:"$handle" string:"$KWALLET_FOLDER" string:"$KWALLET_APP_ID" \
+        >/dev/null 2>&1 || true
+}
+
 kwallet_store() {
     local name="$1" password="$2"
-    ensure_kwallet
-    local result
-    result=$(echo -n "$password" | kwallet-query -w "cred-$name" -f "$KWALLET_FOLDER" "$KWALLET_NAME" 2>&1) || true
-    if [[ "$result" == *"does not exist"* ]]; then
-        die "failed to store password in KDE Wallet. Open KWallet Manager and ensure '$KWALLET_NAME' is open, then retry."
+    local handle
+    handle=$(kwallet_open)
+    kwallet_ensure_folder "$handle"
+    local rc
+    rc=$(dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
+        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.writePassword" \
+        int32:"$handle" string:"$KWALLET_FOLDER" string:"cred-$name" \
+        string:"$password" string:"$KWALLET_APP_ID" 2>/dev/null \
+        | grep int32 | awk '{print $2}')
+    if [[ "$rc" != "0" ]]; then
+        die "failed to store password in KDE Wallet"
     fi
 }
 
 kwallet_read() {
     local name="$1"
-    ensure_kwallet
+    local handle
+    handle=$(kwallet_open) || { echo ""; return; }
     local result
-    result=$(kwallet-query -r "cred-$name" -f "$KWALLET_FOLDER" "$KWALLET_NAME" 2>/dev/null) || true
-    # kwallet-query prints errors to stdout — filter them out
-    if [[ "$result" == *"does not exist"* || -z "$result" ]]; then
-        echo ""
-    else
-        echo "$result"
-    fi
+    result=$(dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
+        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.readPassword" \
+        int32:"$handle" string:"$KWALLET_FOLDER" string:"cred-$name" \
+        string:"$KWALLET_APP_ID" 2>/dev/null \
+        | grep string | head -1 | sed 's/^[[:space:]]*string "\(.*\)"$/\1/')
+    echo "$result"
 }
 
 kwallet_remove() {
     local name="$1"
-    ensure_kwallet
-    # kwallet-query has no delete, use qdbus
-    qdbus org.kde.kwalletd6 /modules/kwalletd6 removeEntry \
-        "$(qdbus org.kde.kwalletd6 /modules/kwalletd6 open "$KWALLET_NAME" 0 "mounty")" \
-        "$KWALLET_FOLDER" "cred-$name" "mounty" 2>/dev/null || true
+    local handle
+    handle=$(kwallet_open) || return 0
+    dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
+        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.removeEntry" \
+        int32:"$handle" string:"$KWALLET_FOLDER" string:"cred-$name" \
+        string:"$KWALLET_APP_ID" >/dev/null 2>&1 || true
 }
 
 # --- Live credential (tmpfs) operations ---
@@ -289,7 +321,7 @@ cmd_unlock() {
     if [[ -n "$shares" ]]; then
         while IFS= read -r name; do
             if write_live_cred "$name"; then
-                (( count++ ))
+                (( count++ )) || true
             fi
         done <<< "$shares"
     fi
@@ -786,6 +818,77 @@ EOF
     info "share '$mount_name' configured. Access $MNT_DIR/$mount_name to auto-mount."
 }
 
+NM_DISPATCHER="/etc/NetworkManager/dispatcher.d/50-mounty"
+
+cmd_reconnect() {
+    local shares
+    shares=$(list_shares)
+    [[ -z "$shares" ]] && return
+
+    # Ensure credentials are available
+    if ! is_unlocked; then
+        info "vault is locked, unlocking first..."
+        cmd_unlock
+    fi
+
+    # Unmount any stale mounts
+    while IFS= read -r name; do
+        if is_mounted "$name"; then
+            sudo umount -l "$MNT_DIR/$name" 2>/dev/null || true
+        fi
+    done <<< "$shares"
+
+    # Reset and restart all automount units
+    local recovered=0
+    while IFS= read -r name; do
+        local unit
+        unit=$(automount_unit_name "$name")
+        local state result
+        state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
+        result=$(systemctl show -p Result --value "$unit" 2>/dev/null || true)
+        if [[ "$state" != "active" || "$result" != "success" ]]; then
+            sudo systemctl reset-failed "$unit" 2>/dev/null || true
+            sudo systemctl restart "$unit" 2>/dev/null || true
+            info "recovered $name"
+            (( recovered++ )) || true
+        fi
+    done <<< "$shares"
+
+    if (( recovered == 0 )); then
+        info "all automounts healthy"
+    else
+        info "$recovered share(s) recovered"
+    fi
+}
+
+cmd_install_dispatcher() {
+    local self
+    self=$(realpath "$0")
+
+    sudo tee "$NM_DISPATCHER" >/dev/null <<SCRIPT
+#!/bin/sh
+# Installed by mounty - reset failed CIFS automounts on network changes
+case "\$2" in
+    up|vpn-up|vpn-down|connectivity-change)
+        sleep 2
+        ${self} reconnect >/dev/null 2>&1 &
+        ;;
+esac
+SCRIPT
+    sudo chmod 755 "$NM_DISPATCHER"
+    info "NetworkManager dispatcher installed at $NM_DISPATCHER"
+    info "failed automounts will now recover automatically after VPN/network changes"
+}
+
+cmd_remove_dispatcher() {
+    if [[ -f "$NM_DISPATCHER" ]]; then
+        sudo rm "$NM_DISPATCHER"
+        info "NetworkManager dispatcher removed"
+    else
+        info "no dispatcher installed"
+    fi
+}
+
 cmd_help() {
     cat <<'EOF'
 mounty - Samba/CIFS share manager
@@ -801,6 +904,9 @@ Usage:
   mounty list                List configured shares
   mounty status [name]       Show detailed share info
   mounty edit <name>         Edit share configuration
+  mounty reconnect           Reset failed automounts (e.g. after VPN)
+  mounty install-dispatcher  Auto-recover mounts on network changes
+  mounty remove-dispatcher   Remove the auto-recovery hook
   mounty help                Show this help
 
 Passwords are stored in KDE Wallet. Live credentials are held in
@@ -827,6 +933,9 @@ main() {
         list|ls) cmd_list "$@" ;;
         status)  cmd_status "$@" ;;
         edit)    cmd_edit "$@" ;;
+        reconnect)  cmd_reconnect "$@" ;;
+        install-dispatcher)  cmd_install_dispatcher "$@" ;;
+        remove-dispatcher)   cmd_remove_dispatcher "$@" ;;
         help|-h|--help) cmd_help ;;
         *)       die "unknown command: $cmd. Run: mounty help" ;;
     esac
