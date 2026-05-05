@@ -4,47 +4,6 @@ A CLI tool for **KDE Plasma** desktops (Kubuntu, KDE Neon, Fedora KDE, etc.) tha
 
 Passwords are stored in **KDE Wallet** — live credentials exist only in RAM (tmpfs), never on disk.
 
-## Requirements
-
-- KDE Plasma desktop (for KDE Wallet integration)
-- `cifs-utils` (installed automatically)
-- `smbclient` (installed automatically when using `browse`)
-- `dbus-send` (ships with dbus, present on virtually all Linux desktops)
-- systemd
-
-## Install
-
-```bash
-./install.sh
-```
-
-This installs the `mounty` command to `~/.local/bin/`, installs `cifs-utils`, creates the required directories, enables a systemd user service for auto-unlock at login, and installs a NetworkManager dispatcher for automatic recovery after VPN/network changes.
-
-## Uninstall
-
-```bash
-./uninstall.sh
-```
-
-This removes all configured shares, the systemd service, the NetworkManager dispatcher, the mounty binary, and credential storage. `cifs-utils` is left installed.
-
-## How it works
-
-```
-~/.mounty/
-  cred-<name>        # username + domain only (no password)
-  live/              # tmpfs (RAM) — full credentials with passwords
-    cred-<name>      # written from KDE Wallet on unlock, gone on lock/reboot
-
-KDE Wallet
-  mounty/cred-<name> # passwords stored here
-```
-
-1. `mounty unlock` mounts a tmpfs at `~/.mounty/live/` and populates credential files from KDE Wallet
-2. fstab entries point to `~/.mounty/live/cred-<name>` — only works while unlocked
-3. `mounty lock` unmounts the tmpfs — all passwords vanish from RAM
-4. On reboot, the tmpfs is gone — run `mounty unlock` again (or automate at login)
-
 ## Usage
 
 ### Unlock / Lock
@@ -161,6 +120,104 @@ With the NetworkManager dispatcher installed (done automatically by `install.sh`
 mounty install-dispatcher    # install auto-recovery hook
 mounty remove-dispatcher     # remove it
 ```
+
+## Install
+
+```bash
+./install.sh
+```
+
+This installs the `mounty` command to `~/.local/bin/`, installs `cifs-utils`, creates the required directories, enables a systemd user service for auto-unlock at login, installs a NetworkManager dispatcher and a systemd-sleep hook for automatic recovery, and installs the privileged helper (`/usr/local/sbin/mounty-helper`) plus its sudoers drop-in. See [Security model](#security-model) for what runs as root and why.
+
+## Uninstall
+
+```bash
+./uninstall.sh           # keep shares, remove the binary + helper + hooks
+./uninstall.sh --purge   # also remove all shares, fstab entries, and KDE Wallet entries
+```
+
+The default uninstall stops the services and removes the mounty binary, the helper, the sudoers drop-in, the systemd user service, and the NetworkManager / sleep hooks. Configured shares, credential files, and KDE Wallet entries are preserved so a later reinstall picks them back up. `--purge` additionally tears down every share and removes the on-disk credential files.
+
+`cifs-utils` is left installed in either case.
+
+## Requirements
+
+- KDE Plasma desktop (for KDE Wallet integration)
+- `cifs-utils` (installed automatically)
+- `smbclient` (installed automatically when using `browse`)
+- `dbus-send` (ships with dbus, present on virtually all Linux desktops)
+- systemd
+
+## How it works
+
+```
+~/.mounty/
+  cred-<name>        # username + domain only (no password)
+  live/              # tmpfs (RAM) — full credentials with passwords
+    cred-<name>      # written from KDE Wallet on unlock, gone on lock/reboot
+
+KDE Wallet
+  mounty/cred-<name> # passwords stored here
+```
+
+1. `mounty unlock` mounts a tmpfs at `~/.mounty/live/` and populates credential files from KDE Wallet
+2. fstab entries point to `~/.mounty/live/cred-<name>` — only works while unlocked
+3. `mounty lock` unmounts the tmpfs — all passwords vanish from RAM
+4. On reboot, the tmpfs is gone — run `mounty unlock` again (or automate at login)
+
+## Security model
+
+Mounty needs root for `mount` / `umount` and for `systemctl daemon-reload` / `automount` actions. The systemd user service and the resume / NetworkManager hooks run without a TTY, so prompting for sudo each time isn't possible — and sudo-rs (Ubuntu's default since 26.04) forbids wildcards in sudoers command arguments, ruling out the traditional "tight rule with `*` in the args" approach. Mounty solves this with one root-owned helper plus a single tightly scoped NOPASSWD grant.
+
+### `/usr/local/sbin/mounty-helper`
+
+A small POSIX-sh script installed root-owned (mode 0755). Every privileged op the Python wrapper needs is dispatched as one of six fixed verbs: `mount-tmpfs`, `umount-tmpfs`, `mount-share`, `umount-share`, `daemon-reload`, `automount`. Anything outside that set is rejected.
+
+What the helper does on every invocation:
+
+- Reads the owning user's name from `/etc/mounty.conf` at runtime; UID, GID, and HOME are looked up via `getent passwd`. Nothing user-controlled is ever templated into the script — the helper file is shipped verbatim.
+- Compares `$SUDO_UID` against the configured user's UID and refuses on mismatch.
+- Resolves every mount/umount target through `realpath` and refuses if the path (or any parent) is a symlink. Closes the "swap `~/.mounty/live` for a symlink to `/etc`" attack against unprivileged code running as the user.
+- Validates every share name against `[A-Za-z0-9._-]+` (no `/`, no `.` / `..`, no shell metacharacters).
+- Acquires `/run/mounty.lock` via `flock` so the systemd user service, NetworkManager dispatcher, sleep hook, and manual CLI cannot race each other into `mount` or `systemctl`.
+- Logs every invocation to syslog (`auth.info`, tag `mounty-helper`). Inspect with `journalctl -t mounty-helper`.
+
+### `/etc/sudoers.d/mounty`
+
+One line:
+
+```
+#1000 ALL=(root) NOPASSWD: /usr/local/sbin/mounty-helper
+```
+
+The grant is by numeric UID (`#UID`) rather than username so it survives a rename without regeneration. The helper itself is the trust boundary; sudo just removes the password prompt for that one path.
+
+### `/etc/mounty.conf`
+
+Root-owned, mode 0644. Contains the username, nothing else. Read on every helper invocation, so UID/GID/HOME drift is self-correcting.
+
+### Python-side input validation
+
+The `mounty` Python wrapper validates every value that ends up in `/etc/fstab` or in a credential file:
+
+| Field | Pattern |
+|-------|---------|
+| `name`, `server` | `[A-Za-z0-9._-]+` |
+| `share` | `[A-Za-z0-9._$-]+` (allows `$` for admin shares like `C$`) |
+| credential fields | rejects `\n`, `\r`, `\0` |
+
+A crafted value cannot inject a second fstab entry or a stray `password=` line into the cred file (which `mount.cifs` would otherwise honour over the real one).
+
+The NetworkManager dispatcher and systemd-sleep hook scripts are generated with `shlex.quote` for any interpolated value, so a `HOME` path with a single quote in it cannot escape the generated `/bin/sh` script.
+
+### Credentials at rest
+
+Passwords live only in:
+
+1. **KDE Wallet** — encrypted, unlocked via PAM at login.
+2. **`~/.mounty/live/cred-<name>`** — on a tmpfs mounted with `mode=700,size=1M`; gone on lock or reboot.
+
+The on-disk `~/.mounty/cred-<name>` files contain only `username=` and `domain=` — no password.
 
 ## fstab
 
