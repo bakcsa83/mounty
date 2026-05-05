@@ -1,0 +1,178 @@
+#!/bin/sh
+# mounty-helper - privileged shim invoked by mounty via sudo.
+#
+# Installed by mounty install.sh; removed by uninstall.sh. Shipped verbatim:
+# the owning username is read from /etc/mounty.conf at runtime, and UID/GID
+# /HOME are looked up via getent. Avoiding installer-side string substitution
+# closes templating-injection vectors (a username or HOME containing shell
+# metacharacters cannot become embedded in the script).
+#
+# The sudoers drop-in grants the configured user passwordless execution of
+# this script only. Wildcards in sudoers command arguments are forbidden by
+# sudo-rs, so we centralise validation here instead.
+
+set -eu
+
+CONFIG_FILE="/etc/mounty.conf"
+
+[ -r "$CONFIG_FILE" ] || {
+    echo "mounty-helper: $CONFIG_FILE missing or unreadable" >&2
+    exit 1
+}
+
+# First non-comment, non-blank line is the username.
+USER_NAME=$(/usr/bin/awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    { print; exit }
+' "$CONFIG_FILE")
+
+case "${USER_NAME:-}" in
+    ""|*[!A-Za-z0-9._-]*)
+        echo "mounty-helper: invalid username in $CONFIG_FILE" >&2
+        exit 1
+        ;;
+esac
+
+USER_HOME=$(/usr/bin/getent passwd "$USER_NAME" | /usr/bin/cut -d: -f6)
+[ -n "$USER_HOME" ] || {
+    echo "mounty-helper: user '$USER_NAME' not found in passwd" >&2
+    exit 1
+}
+case "$USER_HOME" in
+    *[!A-Za-z0-9._/-]*)
+        echo "mounty-helper: home '$USER_HOME' contains unsafe characters" >&2
+        exit 1
+        ;;
+esac
+
+USER_UID=$(/usr/bin/id -u "$USER_NAME")
+USER_GID=$(/usr/bin/id -g "$USER_NAME")
+
+LIVE="$USER_HOME/.mounty/live"
+MNT="$USER_HOME/mnt"
+CRED_DIR="$USER_HOME/.mounty"
+
+# Audit trail. Logged before the SUDO_UID check so rejected attempts are
+# also recorded — that's the signal we want for incident response.
+/usr/bin/logger -t mounty-helper -p auth.info \
+    "uid=${SUDO_UID:-?} args=$*" 2>/dev/null || true
+
+# Compare numeric UIDs (not SUDO_USER vs USER_NAME) so a username rename that
+# updates /etc/passwd in place doesn't require regenerating sudoers; the UID
+# is the stable identity and matches the #UID grant in /etc/sudoers.d/mounty.
+if [ "${SUDO_UID:-}" != "$USER_UID" ]; then
+    echo "mounty-helper: invoked by uid=${SUDO_UID:-?}, expected $USER_UID ($USER_NAME)" >&2
+    exit 1
+fi
+
+valid_share() {
+    case "$1" in
+        ""|.|..) return 1 ;;
+        */*|*\\*) return 1 ;;
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ -f "$CRED_DIR/cred-$1" ]
+}
+
+# Refuse if the target path or any parent component is a symlink.
+# An unprivileged caller controls everything under $USER_HOME, so without this
+# guard they could swap e.g. ~/.mounty/live for a symlink to /etc and have
+# mount/umount act on that location instead.
+require_canonical() {
+    if [ -L "$1" ]; then
+        echo "mounty-helper: refusing — '$1' is a symlink" >&2
+        exit 1
+    fi
+    canon=$(/usr/bin/realpath -- "$1" 2>/dev/null) || {
+        echo "mounty-helper: cannot resolve '$1'" >&2
+        exit 1
+    }
+    if [ "$canon" != "$1" ]; then
+        echo "mounty-helper: refusing — '$1' resolves to '$canon'" >&2
+        exit 1
+    fi
+}
+
+is_mountpoint() {
+    /usr/bin/mountpoint -q -- "$1"
+}
+
+# Sets global $UNIT instead of using command substitution so that an error
+# inside (systemd-escape failure, empty output) actually halts the helper —
+# `UNIT=$(unit_for ...)` would swallow the failure since `set -e` doesn't
+# trip on assignments.
+unit_for() {
+    UNIT=""
+    u=$(/usr/bin/systemd-escape -p "$MNT/$1") || return 1
+    [ -n "$u" ] || return 1
+    UNIT="$u.automount"
+}
+
+# Serialize concurrent invocations. The systemd user service, NetworkManager
+# dispatcher, sleep hook, and manual CLI can all reach the helper at once
+# (e.g. resume from suspend while the user is running `mounty mount`); mount
+# and systemctl are not safe to interleave.
+exec 9>/run/mounty.lock
+if ! /usr/bin/flock -x -w 10 9; then
+    echo "mounty-helper: timed out acquiring /run/mounty.lock" >&2
+    exit 1
+fi
+
+cmd="${1:-}"
+[ "$#" -ge 1 ] && shift
+
+case "$cmd" in
+    mount-tmpfs)
+        [ "$#" -eq 0 ] || { echo "mount-tmpfs: no arguments" >&2; exit 2; }
+        require_canonical "$LIVE"
+        is_mountpoint "$LIVE" && exit 0
+        exec /usr/bin/mount -t tmpfs \
+            -o "size=1M,mode=700,uid=$USER_UID,gid=$USER_GID" tmpfs "$LIVE"
+        ;;
+    umount-tmpfs)
+        [ "$#" -eq 0 ] || { echo "umount-tmpfs: no arguments" >&2; exit 2; }
+        require_canonical "$LIVE"
+        is_mountpoint "$LIVE" || exit 0
+        if /usr/bin/umount "$LIVE" 2>/dev/null; then
+            exit 0
+        fi
+        exec /usr/bin/umount -l "$LIVE"
+        ;;
+    mount-share)
+        [ "$#" -eq 1 ] || { echo "mount-share NAME" >&2; exit 2; }
+        valid_share "$1" || { echo "mount-share: invalid share '$1'" >&2; exit 2; }
+        require_canonical "$MNT/$1"
+        exec /usr/bin/mount "$MNT/$1"
+        ;;
+    umount-share)
+        [ "$#" -eq 1 ] || { echo "umount-share NAME" >&2; exit 2; }
+        valid_share "$1" || { echo "umount-share: invalid share '$1'" >&2; exit 2; }
+        require_canonical "$MNT/$1"
+        if /usr/bin/umount "$MNT/$1" 2>/dev/null; then
+            exit 0
+        fi
+        exec /usr/bin/umount -l "$MNT/$1"
+        ;;
+    daemon-reload)
+        [ "$#" -eq 0 ] || { echo "daemon-reload: no arguments" >&2; exit 2; }
+        exec /usr/bin/systemctl daemon-reload
+        ;;
+    automount)
+        [ "$#" -eq 2 ] || { echo "automount ACTION NAME" >&2; exit 2; }
+        case "$1" in
+            start|stop|restart|reset-failed) ;;
+            *) echo "automount: invalid action '$1'" >&2; exit 2 ;;
+        esac
+        valid_share "$2" || { echo "automount: invalid share '$2'" >&2; exit 2; }
+        unit_for "$2" || {
+            echo "automount: systemd-escape failed for '$2'" >&2
+            exit 1
+        }
+        exec /usr/bin/systemctl "$1" "$UNIT"
+        ;;
+    *)
+        echo "mounty-helper: unknown verb '$cmd'" >&2
+        exit 2
+        ;;
+esac

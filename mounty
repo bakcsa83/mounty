@@ -1,896 +1,868 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""mounty - Samba/CIFS share manager for KDE Plasma"""
 
-# Mounty - User-friendly CIFS mount manager for Linux
-# Uses kernel CIFS mounts instead of GVFS for reliability
-# Passwords stored in KDE Wallet, live credentials in tmpfs (RAM only)
+import getpass
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
-CRED_DIR="$HOME/.mounty"
-LIVE_DIR="$HOME/.mounty/live"
-MNT_DIR="$HOME/mnt"
-FSTAB="/etc/fstab"
-FSTAB_MARKER="mounty"
-FSTAB_BEGIN="# >>> mounty managed mounts - do not edit manually >>>"
-FSTAB_END="# <<< mounty managed mounts <<<"
-KWALLET_FOLDER="mounty"
-KWALLET_NAME="kdewallet"
+HOME = Path.home()
+CRED_DIR = HOME / ".mounty"
+LIVE_DIR = HOME / ".mounty" / "live"
+MNT_DIR = HOME / "mnt"
+FSTAB = Path("/etc/fstab")
+FSTAB_MARKER = "mounty"
+FSTAB_BEGIN = "# >>> mounty managed mounts - do not edit manually >>>"
+FSTAB_END = "# <<< mounty managed mounts <<<"
+NM_DISPATCHER = Path("/etc/NetworkManager/dispatcher.d/50-mounty")
+SLEEP_HOOK    = Path("/usr/lib/systemd/system-sleep/mounty")
+HELPER        = Path("/usr/local/sbin/mounty-helper")
+
+KWALLET_FOLDER = "mounty"
+KWALLET_NAME = "kdewallet"
+KWALLET_DBUS_DEST = "org.kde.kwalletd6"
+KWALLET_DBUS_PATH = "/modules/kwalletd6"
+KWALLET_DBUS_IFACE = "org.kde.KWallet"
+KWALLET_APP_ID = "mounty"
+USERNAME_HINT = "Username (DOMAIN\\user or user@DOMAIN)"
+
+SMB_DIALECT_MAP = {
+    "SMB3_11": "3.1.1",
+    "SMB3_02": "3.0.2",
+    "SMB3_00": "3.0",
+    "SMB2_10": "2.1",
+    "SMB2_02": "2.0",
+    "NT1":     "1.0",
+}
+
 
 # --- Output helpers ---
 
-die() { echo "error: $*" >&2; exit 1; }
-info() { echo ":: $*"; }
-warn() { echo "warning: $*" >&2; }
+def die(msg: str):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def info(msg: str):
+    print(f":: {msg}")
+
+def warn(msg: str):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+# --- Field validators ---
+#
+# Strict whitelists for any value written to /etc/fstab, used as a filesystem
+# path component, or written into a credential file. Without these, whitespace
+# or '#' in user input would let a crafted server/share/name inject extra
+# fstab entries; a newline in a username would let it inject a 'password='
+# line into the cred file (which mount.cifs would honour over the real one).
+
+_NAME_RE   = re.compile(r"^[A-Za-z0-9._-]+$")
+_SERVER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SHARE_RE  = re.compile(r"^[A-Za-z0-9._$-]+$")
+
+def _check_name(name: str):
+    if name in (".", "..") or not _NAME_RE.match(name or ""):
+        die(f"invalid share name '{name}': "
+            "use letters, digits, '.', '_', '-' only (no '.' or '..')")
+
+def _check_server(s: str):
+    if not _SERVER_RE.match(s or ""):
+        die(f"invalid server '{s}': use letters, digits, '.', '_', '-' only")
+
+def _check_share(s: str):
+    if not _SHARE_RE.match(s or ""):
+        die(f"invalid share '{s}': use letters, digits, '.', '_', '$', '-' only")
+
+def _check_credfield(field: str, value: str):
+    if any(c in value for c in "\n\r\0"):
+        die(f"invalid {field}: control characters not allowed")
+
+
+# --- Subprocess helpers ---
+
+def _run(*cmd):
+    subprocess.run(list(cmd), check=True)
+
+def _sudo(*cmd):
+    _run("sudo", *cmd)
+
+def _helper(*args, capture: bool = False) -> subprocess.CompletedProcess:
+    """Invoke the privileged helper. install.sh sets up passwordless sudo
+    for it so this works from the systemd user service and resume hooks."""
+    if not HELPER.exists():
+        die(f"{HELPER} not found. Re-run install.sh.")
+    return subprocess.run(
+        ["sudo", str(HELPER), *args],
+        capture_output=capture,
+    )
+
+def _capture(*cmd, default: str = "") -> str:
+    r = subprocess.run(list(cmd), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else default
+
 
 # --- Dependency checks ---
 
-ensure_deps() {
-    if ! command -v mount.cifs &>/dev/null; then
-        echo "cifs-utils is not installed."
-        read -rp "Install it now? [Y/n] " ans
-        if [[ "${ans,,}" != "n" ]]; then
-            sudo apt install -y cifs-utils
-        else
-            die "cifs-utils is required"
-        fi
-    fi
-}
+def ensure_deps():
+    if not shutil.which("mount.cifs"):
+        print("cifs-utils is not installed.")
+        if input("Install it now? [Y/n] ").strip().lower() != "n":
+            _sudo("apt", "install", "-y", "cifs-utils")
+        else:
+            die("cifs-utils is required")
 
-ensure_smbclient() {
-    if ! command -v smbclient &>/dev/null; then
-        echo "smbclient is not installed (needed for browsing)."
-        read -rp "Install it now? [Y/n] " ans
-        if [[ "${ans,,}" != "n" ]]; then
-            sudo apt install -y smbclient
-        else
-            die "smbclient is required for browsing"
-        fi
-    fi
-}
+def ensure_smbclient():
+    if not shutil.which("smbclient"):
+        print("smbclient is not installed (needed for browsing).")
+        if input("Install it now? [Y/n] ").strip().lower() != "n":
+            _sudo("apt", "install", "-y", "smbclient")
+        else:
+            die("smbclient is required for browsing")
 
-ensure_kwallet() {
-    if ! command -v dbus-send &>/dev/null; then
-        die "dbus-send not found. Install dbus: sudo apt install dbus"
-    fi
-}
+def ensure_kwallet():
+    if not shutil.which("dbus-send"):
+        die("dbus-send not found. Install dbus: sudo apt install dbus")
+
+
+# --- KDE Wallet (via dbus-send) ---
+
+def _dbus(method: str, *args) -> str:
+    r = subprocess.run(
+        ["dbus-send", "--session", f"--dest={KWALLET_DBUS_DEST}", "--print-reply",
+         KWALLET_DBUS_PATH, f"{KWALLET_DBUS_IFACE}.{method}", *args],
+        capture_output=True, text=True,
+    )
+    return r.stdout if r.returncode == 0 else ""
+
+def _dbus_int(output: str) -> str:
+    m = re.search(r"int32 (-?\d+)", output)
+    return m.group(1) if m else ""
+
+def _dbus_str(output: str) -> str:
+    m = re.search(r'^\s*string "(.*)"$', output, re.MULTILINE)
+    return m.group(1) if m else ""
+
+def kwallet_open() -> str:
+    out = _dbus("open", f"string:{KWALLET_NAME}", "int64:0", f"string:{KWALLET_APP_ID}")
+    handle = _dbus_int(out)
+    if not handle or handle == "-1":
+        die(f"failed to open KDE Wallet. Ensure '{KWALLET_NAME}' is open.")
+    return handle
+
+def kwallet_ensure_folder(handle: str):
+    _dbus("createFolder", f"int32:{handle}", f"string:{KWALLET_FOLDER}",
+          f"string:{KWALLET_APP_ID}")
+
+def kwallet_store(name: str, password: str):
+    handle = kwallet_open()
+    kwallet_ensure_folder(handle)
+    out = _dbus("writePassword", f"int32:{handle}", f"string:{KWALLET_FOLDER}",
+                f"string:cred-{name}", f"string:{password}", f"string:{KWALLET_APP_ID}")
+    if _dbus_int(out) != "0":
+        die("failed to store password in KDE Wallet")
+
+def kwallet_read(name: str) -> str:
+    handle = kwallet_open()
+    out = _dbus("readPassword", f"int32:{handle}", f"string:{KWALLET_FOLDER}",
+                f"string:cred-{name}", f"string:{KWALLET_APP_ID}")
+    return _dbus_str(out)
+
+def kwallet_remove(name: str):
+    handle = kwallet_open()
+    _dbus("removeEntry", f"int32:{handle}", f"string:{KWALLET_FOLDER}",
+          f"string:cred-{name}", f"string:{KWALLET_APP_ID}")
+
 
 # --- Helpers ---
 
-USERNAME_HINT='Username (DOMAIN\user or user@DOMAIN)'
+def parse_username(s: str, default_domain: str = "WORKGROUP") -> tuple[str, str]:
+    """Return (username, domain)."""
+    if "\\" in s:
+        domain, username = s.split("\\", 1)
+    elif "@" in s:
+        username, domain = s.split("@", 1)
+    else:
+        username, domain = s, default_domain
+    return username, domain
 
-# Parse domain from username input (DOMAIN\user or user@DOMAIN)
-# Sets: username, domain
-parse_username() {
-    local input="$1" default_domain="${2:-WORKGROUP}"
-    if [[ "$input" == *\\* ]]; then
-        domain="${input%%\\*}"
-        username="${input#*\\}"
-    elif [[ "$input" == *@* ]]; then
-        username="${input%%@*}"
-        domain="${input#*@}"
-    else
-        username="$input"
-        domain="$default_domain"
-    fi
-}
+def detect_smb_version(server: str, auth_args: list[str]) -> str:
+    r = subprocess.run(
+        ["smbclient", "-L", f"//{server}", *auth_args, "-d", "4"],
+        capture_output=True, text=True,
+    )
+    m = re.search(r"negotiated dialect\[([^\]]+)\]", r.stdout + r.stderr)
+    return SMB_DIALECT_MAP.get(m.group(1), "") if m else ""
 
-# Detect negotiated SMB version by parsing smbclient debug output.
-# Usage: detect_smb_version server [auth_args...]
-# Prints the CIFS vers= value (e.g. 3.1.1, 3.0, 2.1) or empty on failure.
-detect_smb_version() {
-    local server="$1"; shift
-    local dialect
-    dialect=$(smbclient -L "//$server" "$@" -d 4 2>&1 | grep -oP 'negotiated dialect\[\K[^\]]+' | head -1)
 
-    case "$dialect" in
-        SMB3_11)  echo "3.1.1" ;;
-        SMB3_02)  echo "3.0.2" ;;
-        SMB3_00)  echo "3.0" ;;
-        SMB2_10)  echo "2.1" ;;
-        SMB2_02)  echo "2.0" ;;
-        NT1)      echo "1.0" ;;
-        *)        echo "" ;;
-    esac
-}
+# --- Live credentials (tmpfs) ---
 
-# --- KDE Wallet operations ---
+def is_unlocked() -> bool:
+    return subprocess.run(
+        ["mountpoint", "-q", str(LIVE_DIR)], capture_output=True
+    ).returncode == 0
 
-KWALLET_DBUS_DEST="org.kde.kwalletd6"
-KWALLET_DBUS_PATH="/modules/kwalletd6"
-KWALLET_DBUS_IFACE="org.kde.KWallet"
-KWALLET_APP_ID="mounty"
+def require_unlocked():
+    if not is_unlocked():
+        die("mounty is locked. Run: mounty unlock")
 
-kwallet_open() {
-    local handle
-    handle=$(dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
-        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.open" \
-        string:"$KWALLET_NAME" int64:0 string:"$KWALLET_APP_ID" 2>/dev/null \
-        | grep int32 | awk '{print $2}')
-    if [[ -z "$handle" || "$handle" == "-1" ]]; then
-        die "failed to open KDE Wallet. Ensure '$KWALLET_NAME' is open."
-    fi
-    echo "$handle"
-}
+def write_live_cred(name: str, password: str = "") -> bool:
+    cred_file = CRED_DIR / f"cred-{name}"
+    if not cred_file.exists():
+        return False
+    lines = cred_file.read_text().splitlines()
+    username = next((l.split("=", 1)[1] for l in lines if l.startswith("username=")), "")
+    domain   = next((l.split("=", 1)[1] for l in lines if l.startswith("domain=")),   "")
+    if not password:
+        password = kwallet_read(name)
+    if not password:
+        warn(f"no password available for '{name}'")
+        return False
+    live = LIVE_DIR / f"cred-{name}"
+    live.write_text(f"username={username}\npassword={password}\ndomain={domain}\n")
+    live.chmod(0o600)
+    return True
 
-kwallet_ensure_folder() {
-    local handle="$1"
-    dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
-        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.createFolder" \
-        int32:"$handle" string:"$KWALLET_FOLDER" string:"$KWALLET_APP_ID" \
-        >/dev/null 2>&1 || true
-}
+def share_exists(name: str) -> bool:
+    return (CRED_DIR / f"cred-{name}").exists()
 
-kwallet_store() {
-    local name="$1" password="$2"
-    local handle
-    handle=$(kwallet_open)
-    kwallet_ensure_folder "$handle"
-    local rc
-    rc=$(dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
-        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.writePassword" \
-        int32:"$handle" string:"$KWALLET_FOLDER" string:"cred-$name" \
-        string:"$password" string:"$KWALLET_APP_ID" 2>/dev/null \
-        | grep int32 | awk '{print $2}')
-    if [[ "$rc" != "0" ]]; then
-        die "failed to store password in KDE Wallet"
-    fi
-}
+def require_share(name: str):
+    _check_name(name)
+    if not share_exists(name):
+        die(f"share '{name}' not found. Run: mounty list")
 
-kwallet_read() {
-    local name="$1"
-    local handle
-    handle=$(kwallet_open) || { echo ""; return; }
-    local result
-    result=$(dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
-        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.readPassword" \
-        int32:"$handle" string:"$KWALLET_FOLDER" string:"cred-$name" \
-        string:"$KWALLET_APP_ID" 2>/dev/null \
-        | grep string | head -1 | sed 's/^[[:space:]]*string "\(.*\)"$/\1/')
-    echo "$result"
-}
+def list_shares() -> list[str]:
+    if not CRED_DIR.is_dir():
+        return []
+    return sorted(
+        f.name[5:] for f in CRED_DIR.iterdir()
+        if f.name.startswith("cred-") and f.is_file()
+    )
 
-kwallet_remove() {
-    local name="$1"
-    local handle
-    handle=$(kwallet_open) || return 0
-    dbus-send --session --dest="$KWALLET_DBUS_DEST" --print-reply \
-        "$KWALLET_DBUS_PATH" "${KWALLET_DBUS_IFACE}.removeEntry" \
-        int32:"$handle" string:"$KWALLET_FOLDER" string:"cred-$name" \
-        string:"$KWALLET_APP_ID" >/dev/null 2>&1 || true
-}
+def is_mounted(name: str) -> bool:
+    return subprocess.run(
+        ["mountpoint", "-q", str(MNT_DIR / name)], capture_output=True
+    ).returncode == 0
 
-# --- Live credential (tmpfs) operations ---
+def _umount_live() -> bool:
+    """Unmount the credentials tmpfs via the helper (lazy fallback inside)."""
+    return _helper("umount-tmpfs", capture=True).returncode == 0
 
-is_unlocked() {
-    mountpoint -q "$LIVE_DIR" 2>/dev/null
-}
+def _umount_share(name: str) -> bool:
+    """Unmount a share's mountpoint via the helper (lazy fallback inside)."""
+    return _helper("umount-share", name, capture=True).returncode == 0
 
-require_unlocked() {
-    is_unlocked || die "mounty is locked. Run: mounty unlock"
-}
 
-# Write a live credential file (in tmpfs) for a share.
-# If password is passed as $2, use it directly; otherwise read from wallet.
-write_live_cred() {
-    local name="$1"
-    local pass_override="${2:-}"
-    local cred_file="$CRED_DIR/cred-$name"
-    [[ -f "$cred_file" ]] || return 1
+# --- fstab ---
 
-    local username domain password
-    username=$(grep '^username=' "$cred_file" | cut -d= -f2-)
-    domain=$(grep '^domain=' "$cred_file" | cut -d= -f2-)
+def automount_unit_name(name: str) -> str:
+    return _capture("systemd-escape", "-p", str(MNT_DIR / name)) + ".automount"
 
-    if [[ -n "$pass_override" ]]; then
-        password="$pass_override"
-    else
-        password=$(kwallet_read "$name")
-    fi
+def automount_start(name: str):
+    _helper("daemon-reload")
+    _helper("automount", "start", name)
+    info(f"automount active for {MNT_DIR / name}")
 
-    if [[ -z "$password" ]]; then
-        warn "no password available for '$name'"
-        return 1
-    fi
+def automount_stop(name: str):
+    _helper("automount", "stop", name, capture=True)
 
-    cat > "$LIVE_DIR/cred-$name" <<EOF
-username=${username}
-password=${password}
-domain=${domain}
-EOF
-    chmod 600 "$LIVE_DIR/cred-$name"
-}
+def _recover_automounts() -> int:
+    """Reset and restart any failed automount units. Returns number recovered."""
+    recovered = 0
+    for name in list_shares():
+        if not get_fstab_line(name):
+            continue
+        unit       = automount_unit_name(name)
+        state      = _capture("systemctl", "show", "-p", "ActiveState", "--value", unit)
+        result_val = _capture("systemctl", "show", "-p", "Result",      "--value", unit)
+        if state != "active" or result_val != "success":
+            _helper("automount", "reset-failed", name, capture=True)
+            _helper("automount", "restart",      name, capture=True)
+            info(f"recovered {name}")
+            recovered += 1
+    return recovered
 
-share_exists() {
-    local name="$1"
-    [[ -f "$CRED_DIR/cred-$name" ]]
-}
+def fstab_read() -> str:
+    return FSTAB.read_text()
 
-require_share() {
-    local name="$1"
-    share_exists "$name" || die "share '$name' not found. Run: mounty list"
-}
+def fstab_write(content: str):
+    p = subprocess.Popen(
+        ["sudo", "tee", str(FSTAB)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL
+    )
+    p.communicate(content.encode())
+    if p.returncode != 0:
+        die("failed to write /etc/fstab")
 
-get_fstab_line() {
-    local name="$1"
-    grep "# ${FSTAB_MARKER}:${name}$" "$FSTAB" 2>/dev/null || true
-}
+def fstab_backup():
+    _sudo("cp", str(FSTAB), str(FSTAB) + ".bak.mounty")
 
-is_mounted() {
-    local name="$1"
-    mountpoint -q "$MNT_DIR/$name" 2>/dev/null
-}
+def fstab_has_section() -> bool:
+    return FSTAB_BEGIN in fstab_read()
 
-list_shares() {
-    [[ -d "$CRED_DIR" ]] || return 0
-    find "$CRED_DIR" -maxdepth 1 -name 'cred-*' -printf '%f\n' 2>/dev/null | sed 's/^cred-//' | sort
-}
+def fstab_ensure_section():
+    if not fstab_has_section():
+        content = fstab_read().rstrip("\n") + f"\n\n{FSTAB_BEGIN}\n{FSTAB_END}\n"
+        fstab_write(content)
 
-# --- fstab operations ---
+def fstab_section_is_empty() -> bool:
+    in_section = False
+    for line in fstab_read().splitlines():
+        if line == FSTAB_BEGIN:
+            in_section = True
+            continue
+        if line == FSTAB_END:
+            break
+        if in_section and line.strip() and not line.startswith("#"):
+            return False
+    return True
 
-automount_unit_name() {
-    local name="$1"
-    echo "$(systemd-escape -p "$MNT_DIR/$name").automount"
-}
+def fstab_remove_section():
+    lines = fstab_read().split("\n")
+    result, skip = [], False
+    for line in lines:
+        if line == FSTAB_BEGIN:
+            skip = True
+            if result and result[-1] == "":
+                result.pop()
+            continue
+        if line == FSTAB_END:
+            skip = False
+            continue
+        if not skip:
+            result.append(line)
+    while result and result[-1] == "":
+        result.pop()
+    fstab_write("\n".join(result) + "\n")
 
-automount_start() {
-    local name="$1"
-    local unit
-    unit=$(automount_unit_name "$name")
-    sudo systemctl daemon-reload
-    sudo systemctl start "$unit"
-    info "automount active for $MNT_DIR/$name"
-}
+def get_fstab_line(name: str) -> str:
+    marker = f"# {FSTAB_MARKER}:{name}"
+    for line in fstab_read().splitlines():
+        if line.endswith(marker):
+            return line
+    return ""
 
-automount_stop() {
-    local name="$1"
-    local unit
-    unit=$(automount_unit_name "$name")
-    sudo systemctl stop "$unit" 2>/dev/null || true
-}
+def fstab_add(name: str, server: str, share: str, vers: str):
+    _check_name(name)
+    _check_server(server)
+    _check_share(share)
+    uid, gid = os.getuid(), os.getgid()
+    opts = (
+        f"credentials={LIVE_DIR}/cred-{name},vers={vers},uid={uid},gid={gid},"
+        f"file_mode=0644,dir_mode=0755,_netdev,x-systemd.automount,"
+        f"x-systemd.idle-timeout=5min,nofail"
+    )
+    entry = f"//{server}/{share} {MNT_DIR}/{name} cifs {opts} 0 0 # {FSTAB_MARKER}:{name}"
+    fstab_backup()
+    fstab_ensure_section()
+    lines = fstab_read().split("\n")
+    result = []
+    for line in lines:
+        if line == FSTAB_END:
+            result.append(entry)
+        result.append(line)
+    fstab_write("\n".join(result))
+    info("fstab entry added")
 
-fstab_backup() {
-    sudo cp "$FSTAB" "${FSTAB}.bak.mounty"
-}
+def fstab_remove(name: str):
+    if not get_fstab_line(name):
+        return
+    fstab_backup()
+    marker = f"# {FSTAB_MARKER}:{name}"
+    content = "\n".join(
+        l for l in fstab_read().split("\n") if not l.endswith(marker)
+    )
+    fstab_write(content)
+    info("fstab entry removed")
+    if fstab_section_is_empty():
+        fstab_remove_section()
+        info("fstab section removed (no shares left)")
 
-fstab_has_section() {
-    grep -qF "$FSTAB_BEGIN" "$FSTAB" 2>/dev/null
-}
-
-fstab_ensure_section() {
-    if ! fstab_has_section; then
-        printf '\n%s\n%s\n' "$FSTAB_BEGIN" "$FSTAB_END" | sudo tee -a "$FSTAB" >/dev/null
-    fi
-}
-
-fstab_section_is_empty() {
-    local content
-    content=$(sudo sed -n "/^${FSTAB_BEGIN}$/,/^${FSTAB_END}$/p" "$FSTAB" | grep -v "^#" | grep -v "^$" || true)
-    [[ -z "$content" ]]
-}
-
-fstab_remove_section() {
-    sudo sed -i "/^${FSTAB_BEGIN}$/,/^${FSTAB_END}$/d" "$FSTAB"
-    sudo sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$FSTAB"
-}
-
-fstab_add() {
-    local name="$1" server="$2" share="$3" vers="$4"
-    local cred_file="$LIVE_DIR/cred-$name"
-    local mnt_point="$MNT_DIR/$name"
-    local uid gid
-    uid=$(id -u)
-    gid=$(id -g)
-
-    local opts="credentials=${cred_file},vers=${vers},uid=${uid},gid=${gid},file_mode=0644,dir_mode=0755,_netdev,x-systemd.automount,x-systemd.idle-timeout=5min,nofail"
-    local entry="//${server}/${share} ${mnt_point} cifs ${opts} 0 0 # ${FSTAB_MARKER}:${name}"
-
-    fstab_backup
-    fstab_ensure_section
-    sudo sed -i "/^${FSTAB_END}$/i ${entry}" "$FSTAB"
-    info "fstab entry added"
-}
-
-fstab_remove() {
-    local name="$1"
-    if [[ -n "$(get_fstab_line "$name")" ]]; then
-        fstab_backup
-        sudo sed -i "/# ${FSTAB_MARKER}:${name}$/d" "$FSTAB"
-        info "fstab entry removed"
-        if fstab_section_is_empty; then
-            fstab_remove_section
-            info "fstab section removed (no shares left)"
-        fi
-    fi
-}
 
 # --- Commands ---
 
-cmd_unlock() {
-    if is_unlocked; then
-        info "already unlocked"
+def cmd_unlock():
+    ensure_kwallet()
+
+    if is_unlocked():
+        # tmpfs already mounted - verify all credential files are present
+        # (recovers from a crashed previous run that left tmpfs but lost creds)
+        repaired = 0
+        for name in list_shares():
+            if not (LIVE_DIR / f"cred-{name}").exists():
+                if write_live_cred(name):
+                    repaired += 1
+        if repaired:
+            info(f"repopulated {repaired} missing credential file(s)")
+        else:
+            info("already unlocked")
+    else:
+        LIVE_DIR.mkdir(parents=True, exist_ok=True)
+        _helper("mount-tmpfs")
+        info(f"tmpfs mounted at {LIVE_DIR}")
+        shares = list_shares()
+        count  = sum(1 for name in shares if write_live_cred(name))
+        info(f"{count} share credential(s) loaded from KDE Wallet")
+
+    # Always reset failed automounts so anything that tried to access a share
+    # before unlock (Dolphin Places, indexers, etc.) gets unstuck.
+    _recover_automounts()
+
+def cmd_lock():
+    for name in list_shares():
+        if is_mounted(name):
+            if not _umount_share(name):
+                warn(f"could not unmount {name}")
+        automount_stop(name)
+    if is_unlocked():
+        _umount_live()
+        info("tmpfs unmounted — credentials cleared from RAM")
+    else:
+        info("already locked")
+
+def cmd_add(name: str):
+    _check_name(name)
+    if share_exists(name):
+        die(f"share '{name}' already exists. Use 'mounty edit {name}' or 'mounty remove {name}' first")
+    ensure_deps()
+    ensure_kwallet()
+
+    print(f"Adding share: {name}")
+    print("---")
+    server = input("Server (hostname or IP): ").strip()
+    if not server:
+        die("server is required")
+    _check_server(server)
+    share = input("Share name: ").strip()
+    if not share:
+        die("share name is required")
+    _check_share(share)
+    raw_user = input(f"{USERNAME_HINT}: ").strip()
+    if not raw_user:
+        die("username is required")
+    username, domain = parse_username(raw_user)
+    _check_credfield("username", username)
+    _check_credfield("domain", domain)
+    password = getpass.getpass("Password: ")
+    if not password:
+        die("password is required")
+
+    ensure_smbclient()
+    info(f"detecting SMB version for {server} ...")
+    vers = detect_smb_version(server, ["-U", f"{username}%{password}", "-W", domain])
+    if vers:
+        info(f"negotiated SMB {vers}")
+    else:
+        vers = "3.1.1"
+        warn(f"could not detect SMB version, defaulting to {vers}")
+
+    kwallet_store(name, password)
+    info("password stored in KDE Wallet")
+
+    CRED_DIR.mkdir(parents=True, exist_ok=True)
+    cred_file = CRED_DIR / f"cred-{name}"
+    cred_file.write_text(f"username={username}\ndomain={domain}\n")
+    cred_file.chmod(0o600)
+    info(f"credentials saved to {cred_file} (password in wallet only)")
+
+    (MNT_DIR / name).mkdir(parents=True, exist_ok=True)
+    info(f"mount point created at {MNT_DIR / name}")
+
+    if not is_unlocked():
+        cmd_unlock()
+    write_live_cred(name, password)
+    fstab_add(name, server, share, vers)
+    automount_start(name)
+
+    print("---")
+    info(f"share '{name}' configured. Access {MNT_DIR / name} to auto-mount.")
+
+def cmd_remove(name: str):
+    require_share(name)
+    if is_mounted(name):
+        if not _umount_share(name):
+            warn(f"could not unmount {MNT_DIR / name}")
+    automount_stop(name)
+    fstab_remove(name)
+    (LIVE_DIR / f"cred-{name}").unlink(missing_ok=True)
+    kwallet_remove(name)
+    info("password removed from KDE Wallet")
+    (CRED_DIR / f"cred-{name}").unlink(missing_ok=True)
+    info("credentials removed")
+    mnt = MNT_DIR / name
+    if mnt.is_dir():
+        try:
+            mnt.rmdir()
+            info("mount point removed")
+        except OSError:
+            warn(f"mount point not empty, kept: {mnt}")
+    _helper("daemon-reload")
+    info(f"share '{name}' removed")
+
+def cmd_mount(name: str):
+    if name == "--all":
+        shares = list_shares()
+        if not shares:
+            die("no shares configured")
+        for s in shares:
+            cmd_mount(s)
         return
-    fi
-
-    ensure_kwallet
-    mkdir -p "$LIVE_DIR"
-    sudo mount -t tmpfs -o size=1M,mode=700,uid="$(id -u)",gid="$(id -g)" tmpfs "$LIVE_DIR"
-    info "tmpfs mounted at $LIVE_DIR"
-
-    # Populate live credentials from wallet
-    local shares count=0
-    shares=$(list_shares)
-    if [[ -n "$shares" ]]; then
-        while IFS= read -r name; do
-            if write_live_cred "$name"; then
-                (( count++ )) || true
-            fi
-        done <<< "$shares"
-    fi
-    info "$count share credential(s) loaded from KDE Wallet"
-}
-
-cmd_lock() {
-    # Unmount all shares first
-    local shares
-    shares=$(list_shares)
-    if [[ -n "$shares" ]]; then
-        while IFS= read -r name; do
-            if is_mounted "$name"; then
-                sudo umount "$MNT_DIR/$name" 2>/dev/null || warn "could not unmount $name"
-            fi
-            automount_stop "$name"
-        done <<< "$shares"
-    fi
-
-    if is_unlocked; then
-        sudo umount "$LIVE_DIR"
-        info "tmpfs unmounted — credentials cleared from RAM"
-    else
-        info "already locked"
-    fi
-}
-
-cmd_add() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && die "usage: mounty add <name>"
-    share_exists "$name" && die "share '$name' already exists. Use 'mounty edit $name' or 'mounty remove $name' first"
-
-    ensure_deps
-    ensure_kwallet
-
-    echo "Adding share: $name"
-    echo "---"
-
-    read -rp "Server (hostname or IP): " server
-    [[ -z "$server" ]] && die "server is required"
-
-    read -rp "Share name: " share
-    [[ -z "$share" ]] && die "share name is required"
-
-    local username="" domain=""
-    read -rp "$USERNAME_HINT: " username
-    [[ -z "$username" ]] && die "username is required"
-    parse_username "$username"
-
-    read -rsp "Password: " password
-    echo
-    [[ -z "$password" ]] && die "password is required"
-
-    # Detect SMB version
-    ensure_smbclient
-    info "detecting SMB version for $server ..."
-    local vers
-    vers=$(detect_smb_version "$server" -U "${username}%${password}" -W "$domain")
-    if [[ -n "$vers" ]]; then
-        info "negotiated SMB $vers"
-    else
-        vers="3.1.1"
-        warn "could not detect SMB version, defaulting to $vers"
-    fi
-
-    # Store password in KDE Wallet
-    kwallet_store "$name" "$password"
-    info "password stored in KDE Wallet"
-
-    # Create permanent credential file (no password)
-    mkdir -p "$CRED_DIR"
-    local cred_file="$CRED_DIR/cred-$name"
-    cat > "$cred_file" <<EOF
-username=${username}
-domain=${domain}
-EOF
-    chmod 600 "$cred_file"
-    info "credentials saved to $cred_file (password in wallet only)"
-
-    # Create mount point
-    mkdir -p "$MNT_DIR/$name"
-    info "mount point created at $MNT_DIR/$name"
-
-    # Write live credential and add fstab entry
-    if ! is_unlocked; then
-        cmd_unlock
-    fi
-    write_live_cred "$name" "$password"
-    fstab_add "$name" "$server" "$share" "$vers"
-    automount_start "$name"
-
-    echo "---"
-    info "share '$name' configured. Access $MNT_DIR/$name to auto-mount."
-}
-
-cmd_remove() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && die "usage: mounty remove <name>"
-    require_share "$name"
-
-    # Unmount if mounted
-    if is_mounted "$name"; then
-        sudo umount "$MNT_DIR/$name" 2>/dev/null || warn "could not unmount $MNT_DIR/$name"
-    fi
-
-    # Stop automount unit
-    automount_stop "$name"
-
-    # Remove fstab entry
-    fstab_remove "$name"
-
-    # Remove live credential
-    rm -f "$LIVE_DIR/cred-$name"
-
-    # Remove password from wallet
-    kwallet_remove "$name"
-    info "password removed from KDE Wallet"
-
-    # Remove permanent credential file
-    rm -f "$CRED_DIR/cred-$name"
-    info "credentials removed"
-
-    # Remove mount point (only if empty)
-    if [[ -d "$MNT_DIR/$name" ]]; then
-        rmdir "$MNT_DIR/$name" 2>/dev/null && info "mount point removed" || warn "mount point not empty, kept: $MNT_DIR/$name"
-    fi
-
-    sudo systemctl daemon-reload
-    info "share '$name' removed"
-}
-
-cmd_mount() {
-    local name="${1:-}"
-
-    if [[ "$name" == "--all" ]]; then
-        local shares
-        shares=$(list_shares)
-        [[ -z "$shares" ]] && die "no shares configured"
-        while IFS= read -r s; do
-            cmd_mount "$s"
-        done <<< "$shares"
+    require_share(name)
+    require_unlocked()
+    if is_mounted(name):
+        info(f"'{name}' is already mounted")
         return
-    fi
+    _helper("mount-share", name)
+    info(f"'{name}' mounted at {MNT_DIR / name}")
 
-    [[ -z "$name" ]] && die "usage: mounty mount <name|--all>"
-    require_share "$name"
-    require_unlocked
-
-    if is_mounted "$name"; then
-        info "'$name' is already mounted"
+def cmd_unmount(name: str):
+    if name == "--all":
+        shares = list_shares()
+        if not shares:
+            die("no shares configured")
+        for s in shares:
+            cmd_unmount(s)
         return
-    fi
-
-    sudo mount "$MNT_DIR/$name"
-    info "'$name' mounted at $MNT_DIR/$name"
-}
-
-cmd_unmount() {
-    local name="${1:-}"
-
-    if [[ "$name" == "--all" ]]; then
-        local shares
-        shares=$(list_shares)
-        [[ -z "$shares" ]] && die "no shares configured"
-        while IFS= read -r s; do
-            cmd_unmount "$s"
-        done <<< "$shares"
+    require_share(name)
+    if not is_mounted(name):
+        info(f"'{name}' is not mounted")
         return
-    fi
+    if not _umount_share(name):
+        die(f"failed to unmount '{name}'")
+    info(f"'{name}' unmounted")
 
-    [[ -z "$name" ]] && die "usage: mounty unmount <name|--all>"
-    require_share "$name"
-
-    if ! is_mounted "$name"; then
-        info "'$name' is not mounted"
+def cmd_list():
+    shares = list_shares()
+    if not shares:
+        print("No shares configured.")
+        print("Run: mounty add <name>")
         return
-    fi
+    print(f"Vault: {'unlocked' if is_unlocked() else 'LOCKED'}")
+    print()
+    print(f"{'NAME':<20} {'STATUS':<10} MOUNT POINT")
+    print(f"{'----':<20} {'------':<10} -----------")
+    for name in shares:
+        status = "mounted" if is_mounted(name) else "unmounted"
+        print(f"{name:<20} {status:<10} {MNT_DIR / name}")
 
-    sudo umount "$MNT_DIR/$name"
-    info "'$name' unmounted"
-}
-
-cmd_list() {
-    local shares
-    shares=$(list_shares)
-
-    if [[ -z "$shares" ]]; then
-        echo "No shares configured."
-        echo "Run: mounty add <name>"
+def cmd_status(name: str = ""):
+    if not name:
+        shares = list_shares()
+        if not shares:
+            print("No shares configured.")
+            return
+        vault = f"unlocked (tmpfs at {LIVE_DIR})" if is_unlocked() else "LOCKED"
+        print(f"Vault: {vault}")
+        print()
+        for s in shares:
+            cmd_status(s)
+            print()
         return
-    fi
+    require_share(name)
+    cred_file = CRED_DIR / f"cred-{name}"
+    live      = LIVE_DIR  / f"cred-{name}"
+    fstab_line = get_fstab_line(name)
+    print(f"Share: {name}")
+    print(f"  Mount point:  {MNT_DIR / name}")
+    print(f"  Config:       {cred_file}")
+    print(f"  Live creds:   {live} {'(ready)' if live.exists() else '(missing)'}")
+    print(f"  Wallet:       {KWALLET_FOLDER}/cred-{name}")
+    if fstab_line:
+        parts  = fstab_line.split()
+        remote = parts[0] if parts else "unknown"
+        opts   = parts[3] if len(parts) > 3 else ""
+        m = re.search(r"vers=([^,]+)", opts)
+        print(f"  Remote:       {remote}")
+        print(f"  SMB version:  {m.group(1) if m else 'unknown'}")
+    else:
+        print("  fstab:        NOT CONFIGURED (missing entry)")
+    if cred_file.exists():
+        lines  = cred_file.read_text().splitlines()
+        user   = next((l.split("=", 1)[1] for l in lines if l.startswith("username=")), "")
+        domain = next((l.split("=", 1)[1] for l in lines if l.startswith("domain=")),   "")
+        print(f"  User:         {domain}\\{user}")
+    print(f"  Status:       {'MOUNTED' if is_mounted(name) else 'unmounted'}")
 
-    local locked_icon=""
-    is_unlocked && locked_icon="unlocked" || locked_icon="LOCKED"
-    echo "Vault: $locked_icon"
-    echo
+def cmd_edit(name: str):
+    require_share(name)
+    ensure_kwallet()
+    cred_file = CRED_DIR / f"cred-{name}"
+    print(f"Editing share: {name}")
+    print("Leave blank to keep current value.")
+    print("---")
 
-    printf "%-20s %-10s %s\n" "NAME" "STATUS" "MOUNT POINT"
-    printf "%-20s %-10s %s\n" "----" "------" "-----------"
+    lines      = cred_file.read_text().splitlines()
+    cur_user   = next((l.split("=", 1)[1] for l in lines if l.startswith("username=")), "")
+    cur_domain = next((l.split("=", 1)[1] for l in lines if l.startswith("domain=")),   "")
 
-    while IFS= read -r name; do
-        local status="unmounted"
-        is_mounted "$name" && status="mounted"
-        printf "%-20s %-10s %s\n" "$name" "$status" "$MNT_DIR/$name"
-    done <<< "$shares"
-}
+    fstab_line = get_fstab_line(name)
+    cur_server = cur_share = ""
+    cur_vers = "3.1.1"
+    if fstab_line:
+        parts  = fstab_line.split()
+        remote = parts[0] if parts else ""
+        m = re.match(r"//([^/]+)/(.*)", remote)
+        if m:
+            cur_server, cur_share = m.group(1), m.group(2)
+        opts = parts[3] if len(parts) > 3 else ""
+        mv = re.search(r"vers=([^,]+)", opts)
+        if mv:
+            cur_vers = mv.group(1)
 
-cmd_status() {
-    local name="${1:-}"
+    server = input(f"Server [{cur_server}]: ").strip() or cur_server
+    _check_server(server)
+    share  = input(f"Share [{cur_share}]: ").strip()   or cur_share
+    _check_share(share)
 
-    if [[ -z "$name" ]]; then
-        local shares
-        shares=$(list_shares)
-        [[ -z "$shares" ]] && { echo "No shares configured."; return; }
+    raw_user = input(f"{USERNAME_HINT} [{cur_domain}\\{cur_user}]: ").strip()
+    if raw_user:
+        username, domain = parse_username(raw_user, cur_domain)
+    else:
+        username, domain = cur_user, cur_domain
+    _check_credfield("username", username)
+    _check_credfield("domain", domain)
 
-        echo "Vault: $(is_unlocked && echo "unlocked (tmpfs at $LIVE_DIR)" || echo "LOCKED")"
-        echo
+    password = getpass.getpass("Password [unchanged]: ")
+    if not password:
+        password = kwallet_read(name)
+        if not password:
+            die("no existing password in wallet and none provided")
 
-        while IFS= read -r s; do
-            cmd_status "$s"
-            echo
-        done <<< "$shares"
+    ensure_smbclient()
+    info(f"detecting SMB version for {server} ...")
+    vers = detect_smb_version(server, ["-U", f"{username}%{password}", "-W", domain])
+    if vers:
+        info(f"negotiated SMB {vers}")
+    else:
+        vers = cur_vers
+        warn(f"could not detect SMB version, keeping {vers}")
+
+    kwallet_store(name, password)
+    info("password updated in KDE Wallet")
+    cred_file.write_text(f"username={username}\ndomain={domain}\n")
+    cred_file.chmod(0o600)
+    info("credentials updated")
+
+    if is_unlocked():
+        write_live_cred(name, password)
+
+    automount_stop(name)
+    fstab_remove(name)
+    fstab_add(name, server, share, vers)
+    automount_start(name)
+    info(f"share '{name}' updated")
+
+def cmd_browse(server: str):
+    _check_server(server)
+    ensure_smbclient()
+    ensure_kwallet()
+
+    raw_user = input(f"{USERNAME_HINT} (blank for anonymous): ").strip()
+    username = password = ""
+    domain   = "WORKGROUP"
+    auth_args: list[str] = []
+    if raw_user:
+        username, domain = parse_username(raw_user)
+        _check_credfield("username", username)
+        _check_credfield("domain", domain)
+        password  = getpass.getpass("Password: ")
+        auth_args = ["-U", f"{username}%{password}", "-W", domain]
+    else:
+        auth_args = ["-N"]
+
+    info(f"browsing //{server} ...")
+    print()
+
+    r = subprocess.run(
+        ["smbclient", "-L", f"//{server}", *auth_args, "-d", "4"],
+        capture_output=True, text=True,
+    )
+    raw = r.stdout + r.stderr
+
+    if r.returncode != 0 and not re.search(r"Disk|IPC|Printer", raw):
+        print(raw, file=sys.stderr)
+        die(f"could not connect to {server}")
+
+    m = re.search(r"negotiated dialect\[([^\]]+)\]", raw)
+    vers = SMB_DIALECT_MAP.get(m.group(1), "") if m else ""
+    if vers:
+        info(f"negotiated SMB {vers}")
+    else:
+        vers = "3.1.1"
+        warn("could not detect SMB version, defaulting to 3.1.1")
+
+    share_names:    list[str] = []
+    share_comments: list[str] = []
+    for line in raw.splitlines():
+        sm = re.match(r"^\s+(\S+)\s+Disk\s*(.*)", line)
+        if sm:
+            share_names.append(sm.group(1))
+            share_comments.append(sm.group(2).strip())
+
+    if not share_names:
+        die(f"no shares found on {server}")
+
+    print(f"  {'#':<4} {'SHARE':<30} COMMENT")
+    print(f"  {'--':<4} {'-----':<30} -------")
+    for i, (sname, comment) in enumerate(zip(share_names, share_comments), 1):
+        print(f"  {i:<4} {sname:<30} {comment}")
+    print()
+
+    choice = input(f"Select share to add [1-{len(share_names)}, or q to quit]: ").strip()
+    if not choice or choice.lower() == "q":
         return
-    fi
+    if not choice.isdigit() or not (1 <= int(choice) <= len(share_names)):
+        die(f"invalid selection: {choice}")
 
-    require_share "$name"
+    selected = share_names[int(choice) - 1]
+    _check_share(selected)
+    info(f"selected: {selected}")
+    print()
 
-    local cred_file="$CRED_DIR/cred-$name"
-    local fstab_line
-    fstab_line=$(get_fstab_line "$name")
+    suggested  = re.sub(r"[^a-z0-9-]", "-", selected.lower()).rstrip("-")
+    mount_name = input(f"Mount name [{suggested}]: ").strip() or suggested
+    _check_name(mount_name)
 
-    echo "Share: $name"
-    echo "  Mount point:  $MNT_DIR/$name"
-    echo "  Config:       $cred_file"
-    echo "  Live creds:   $LIVE_DIR/cred-$name $([ -f "$LIVE_DIR/cred-$name" ] && echo "(ready)" || echo "(missing)")"
-    echo "  Wallet:       $KWALLET_FOLDER/cred-$name"
+    if share_exists(mount_name):
+        die(f"share '{mount_name}' already exists. Use 'mounty edit {mount_name}' or 'mounty remove {mount_name}' first")
 
-    if [[ -n "$fstab_line" ]]; then
-        local remote
-        remote=$(echo "$fstab_line" | awk '{print $1}')
-        local opts
-        opts=$(echo "$fstab_line" | awk '{print $4}')
-        local vers
-        vers=$(echo "$opts" | grep -oP 'vers=\K[^,]+' || echo "unknown")
-        echo "  Remote:       $remote"
-        echo "  SMB version:  $vers"
-    else
-        echo "  fstab:        NOT CONFIGURED (missing entry)"
-    fi
+    if not username:
+        raw_user = input(f"{USERNAME_HINT}: ").strip()
+        if not raw_user:
+            die("username is required")
+        username, domain = parse_username(raw_user)
+        _check_credfield("username", username)
+        _check_credfield("domain", domain)
+        password = getpass.getpass("Password: ")
+        if not password:
+            die("password is required")
 
-    if [[ -f "$cred_file" ]]; then
-        local user domain
-        user=$(grep '^username=' "$cred_file" | cut -d= -f2-)
-        domain=$(grep '^domain=' "$cred_file" | cut -d= -f2-)
-        echo "  User:         ${domain}\\${user}"
-    fi
+    ensure_deps()
+    kwallet_store(mount_name, password)
+    info("password stored in KDE Wallet")
 
-    if is_mounted "$name"; then
-        echo "  Status:       MOUNTED"
-    else
-        echo "  Status:       unmounted"
-    fi
-}
+    CRED_DIR.mkdir(parents=True, exist_ok=True)
+    cred_file = CRED_DIR / f"cred-{mount_name}"
+    cred_file.write_text(f"username={username}\ndomain={domain}\n")
+    cred_file.chmod(0o600)
+    info(f"credentials saved to {cred_file} (password in wallet only)")
 
-cmd_edit() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && die "usage: mounty edit <name>"
-    require_share "$name"
+    (MNT_DIR / mount_name).mkdir(parents=True, exist_ok=True)
+    info(f"mount point created at {MNT_DIR / mount_name}")
 
-    ensure_kwallet
-    local cred_file="$CRED_DIR/cred-$name"
+    if not is_unlocked():
+        cmd_unlock()
+    write_live_cred(mount_name, password)
+    fstab_add(mount_name, server, selected, vers)
+    automount_start(mount_name)
 
-    echo "Editing share: $name"
-    echo "Leave blank to keep current value."
-    echo "---"
+    print("---")
+    info(f"share '{mount_name}' configured. Access {MNT_DIR / mount_name} to auto-mount.")
 
-    local cur_user cur_domain cur_server cur_share cur_vers
-    cur_user=$(grep '^username=' "$cred_file" | cut -d= -f2-)
-    cur_domain=$(grep '^domain=' "$cred_file" | cut -d= -f2-)
+def cmd_reconnect():
+    shares = list_shares()
+    if not shares:
+        return
+    if not is_unlocked():
+        info("vault is locked, unlocking first...")
+        cmd_unlock()
+    for name in shares:
+        if is_mounted(name):
+            _umount_share(name)
+    recovered = _recover_automounts()
+    if recovered == 0:
+        info("all automounts healthy")
+    else:
+        info(f"{recovered} share(s) recovered")
 
-    local fstab_line
-    fstab_line=$(get_fstab_line "$name")
-    if [[ -n "$fstab_line" ]]; then
-        local remote
-        remote=$(echo "$fstab_line" | awk '{print $1}')
-        cur_server=$(echo "$remote" | sed 's|^//||; s|/.*||')
-        cur_share=$(echo "$remote" | sed 's|^//[^/]*/||')
-        cur_vers=$(echo "$fstab_line" | grep -oP 'vers=\K[^,]+' || echo "3.1.1")
-    else
-        cur_server="" cur_share="" cur_vers="3.1.1"
-    fi
+def _current_user() -> str:
+    return (os.environ.get("SUDO_USER") or os.environ.get("USER")
+            or pwd.getpwuid(os.getuid()).pw_name)
 
-    read -rp "Server [$cur_server]: " server
-    server="${server:-$cur_server}"
+def _hook_script(self_path: str, user: str, trigger: str) -> str:
+    """Generate a /bin/sh hook script that dispatches `mounty reconnect` to
+    the install-time user with their session bus and runtime dir.
 
-    read -rp "Share [$cur_share]: " share
-    share="${share:-$cur_share}"
+    The hook itself runs as root (NM dispatchers and system-sleep hooks both
+    do); without dispatching to the user, mounty cannot reach KDE Wallet."""
+    if trigger == "nm":
+        guard = ('case "$2" in\n'
+                 '    up|vpn-up|vpn-down|connectivity-change) ;;\n'
+                 '    *) exit 0 ;;\n'
+                 'esac')
+        delay = 2
+    elif trigger == "sleep":
+        guard = '[ "$1" = "post" ] || exit 0'
+        delay = 3
+    else:
+        die(f"unknown hook trigger: {trigger}")
 
-    local cur_combined="${cur_domain}\\${cur_user}"
-    local username="" domain=""
-    read -rp "$USERNAME_HINT [$cur_combined]: " username
-    if [[ -n "$username" ]]; then
-        parse_username "$username" "$cur_domain"
-    else
-        username="$cur_user"
-        domain="$cur_domain"
-    fi
+    target_user = shlex.quote(user)
+    cmd_path    = shlex.quote(self_path)
+    return f"""#!/bin/sh
+# Installed by mounty - {trigger} hook for auto-recovery
 
-    read -rsp "Password [unchanged]: " password
-    echo
-    if [[ -z "$password" ]]; then
-        password=$(kwallet_read "$name")
-        [[ -z "$password" ]] && die "no existing password in wallet and none provided"
-    fi
+{guard}
 
-    # Re-detect SMB version
-    ensure_smbclient
-    info "detecting SMB version for $server ..."
-    local vers
-    vers=$(detect_smb_version "$server" -U "${username}%${password}" -W "$domain")
-    if [[ -n "$vers" ]]; then
-        info "negotiated SMB $vers"
-    else
-        vers="$cur_vers"
-        warn "could not detect SMB version, keeping $vers"
-    fi
+TARGET_USER={target_user}
+USER_ID=$(id -u "$TARGET_USER" 2>/dev/null)
+[ -n "$USER_ID" ] || exit 0
 
-    # Update wallet
-    kwallet_store "$name" "$password"
-    info "password updated in KDE Wallet"
+# Skip if the user has no active session (e.g. boot before login)
+loginctl show-user "$TARGET_USER" --property=State --value 2>/dev/null \\
+    | grep -q active || exit 0
 
-    # Update permanent credential file (no password)
-    cat > "$cred_file" <<EOF
-username=${username}
-domain=${domain}
-EOF
-    chmod 600 "$cred_file"
-    info "credentials updated"
+# Run in background so we never block resume / NM
+(
+    sleep {delay}
+    runuser -u "$TARGET_USER" -- env \\
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_ID/bus" \\
+        XDG_RUNTIME_DIR="/run/user/$USER_ID" \\
+        {cmd_path} reconnect >/dev/null 2>&1
+) &
+"""
 
-    # Rebuild live credential
-    if is_unlocked; then
-        write_live_cred "$name" "$password"
-    fi
+def _write_root_file(path: Path, content: str):
+    p = subprocess.Popen(
+        ["sudo", "tee", str(path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL
+    )
+    p.communicate(content.encode())
+    if p.returncode != 0:
+        die(f"failed to write {path}")
+    _sudo("chmod", "755", str(path))
 
-    # Update fstab and restart automount
-    automount_stop "$name"
-    fstab_remove "$name"
-    fstab_add "$name" "$server" "$share" "$vers"
-    automount_start "$name"
-    info "share '$name' updated"
-}
+def cmd_install_dispatcher():
+    self_path = os.path.realpath(sys.argv[0])
+    user      = _current_user()
 
-cmd_browse() {
-    local server="${1:-}"
-    [[ -z "$server" ]] && die "usage: mounty browse <server>"
+    _write_root_file(NM_DISPATCHER, _hook_script(self_path, user, "nm"))
+    info(f"NetworkManager dispatcher installed at {NM_DISPATCHER}")
 
-    ensure_smbclient
-    ensure_kwallet
+    _write_root_file(SLEEP_HOOK, _hook_script(self_path, user, "sleep"))
+    info(f"systemd-sleep hook installed at {SLEEP_HOOK}")
 
-    # Ask for credentials (optional for anonymous access)
-    local username="" password="" domain="WORKGROUP" auth_args=()
+    info(f"auto-recovery hooks active for user '{user}' "
+         "(VPN/network changes, resume from suspend)")
 
-    read -rp "$USERNAME_HINT (blank for anonymous): " username
-    if [[ -n "$username" ]]; then
-        parse_username "$username"
-        read -rsp "Password: " password
-        echo
-        auth_args=(-U "${username}%${password}" -W "$domain")
-    else
-        auth_args=(-N)
-    fi
+def cmd_remove_dispatcher():
+    removed = 0
+    if NM_DISPATCHER.exists():
+        _sudo("rm", str(NM_DISPATCHER))
+        info("NetworkManager dispatcher removed")
+        removed += 1
+    if SLEEP_HOOK.exists():
+        _sudo("rm", str(SLEEP_HOOK))
+        info("systemd-sleep hook removed")
+        removed += 1
+    if removed == 0:
+        info("no hooks installed")
 
-    info "browsing //$server ..."
-    echo
-
-    local raw_output
-    if ! raw_output=$(smbclient -L "//$server" "${auth_args[@]}" -d 4 2>&1); then
-        if ! echo "$raw_output" | grep -q "Disk\|IPC\|Printer"; then
-            echo "$raw_output" >&2
-            die "could not connect to $server"
-        fi
-    fi
-
-    # Detect negotiated SMB version from debug output
-    local dialect vers=""
-    dialect=$(echo "$raw_output" | grep -oP 'negotiated dialect\[\K[^\]]+' | head -1)
-    case "$dialect" in
-        SMB3_11)  vers="3.1.1" ;;
-        SMB3_02)  vers="3.0.2" ;;
-        SMB3_00)  vers="3.0" ;;
-        SMB2_10)  vers="2.1" ;;
-        SMB2_02)  vers="2.0" ;;
-        NT1)      vers="1.0" ;;
-    esac
-    if [[ -n "$vers" ]]; then
-        info "negotiated SMB $vers"
-    else
-        vers="3.1.1"
-        warn "could not detect SMB version, defaulting to $vers"
-    fi
-
-    # Parse share list
-    local -a share_names=()
-    local -a share_types=()
-    local -a share_comments=()
-
-    while IFS= read -r line; do
-        local name type comment
-        name=$(echo "$line" | awk '{print $1}')
-        type=$(echo "$line" | awk '{print $2}')
-        comment=$(echo "$line" | sed 's/^[[:space:]]*[^[:space:]]*[[:space:]]*[^[:space:]]*[[:space:]]*//')
-
-        if [[ "$type" == "Disk" ]]; then
-            share_names+=("$name")
-            share_types+=("$type")
-            share_comments+=("$comment")
-        fi
-    done < <(echo "$raw_output" | grep -P '^\s+\S+\s+(Disk|Printer)' || true)
-
-    if [[ ${#share_names[@]} -eq 0 ]]; then
-        die "no shares found on $server"
-    fi
-
-    # Display numbered list
-    printf "  %-4s %-30s %s\n" "#" "SHARE" "COMMENT"
-    printf "  %-4s %-30s %s\n" "--" "-----" "-------"
-    for i in "${!share_names[@]}"; do
-        printf "  %-4s %-30s %s\n" "$((i + 1))" "${share_names[$i]}" "${share_comments[$i]}"
-    done
-    echo
-
-    # Let user pick
-    read -rp "Select share to add [1-${#share_names[@]}, or q to quit]: " choice
-
-    [[ "$choice" == "q" || -z "$choice" ]] && return
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#share_names[@]} )); then
-        die "invalid selection: $choice"
-    fi
-
-    local selected_share="${share_names[$((choice - 1))]}"
-    info "selected: $selected_share"
-    echo
-
-    # Suggest a mount name (lowercase, sanitized)
-    local suggested_name
-    suggested_name=$(echo "$selected_share" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]-' '-' | sed 's/-$//')
-    read -rp "Mount name [$suggested_name]: " mount_name
-    mount_name="${mount_name:-$suggested_name}"
-
-    if share_exists "$mount_name"; then
-        die "share '$mount_name' already exists. Use 'mounty edit $mount_name' or 'mounty remove $mount_name' first"
-    fi
-
-    # Reuse credentials from browse or prompt fresh
-    if [[ -z "$username" ]]; then
-        read -rp "$USERNAME_HINT: " username
-        [[ -z "$username" ]] && die "username is required"
-        parse_username "$username"
-        read -rsp "Password: " password
-        echo
-        [[ -z "$password" ]] && die "password is required"
-    fi
-
-    ensure_deps
-
-    # Store password in KDE Wallet
-    kwallet_store "$mount_name" "$password"
-    info "password stored in KDE Wallet"
-
-    # Create permanent credential file (no password)
-    mkdir -p "$CRED_DIR"
-    local cred_file="$CRED_DIR/cred-$mount_name"
-    cat > "$cred_file" <<EOF
-username=${username}
-domain=${domain}
-EOF
-    chmod 600 "$cred_file"
-    info "credentials saved to $cred_file (password in wallet only)"
-
-    # Create mount point
-    mkdir -p "$MNT_DIR/$mount_name"
-    info "mount point created at $MNT_DIR/$mount_name"
-
-    # Write live credential and add fstab entry
-    if ! is_unlocked; then
-        cmd_unlock
-    fi
-    write_live_cred "$mount_name" "$password"
-    fstab_add "$mount_name" "$server" "$selected_share" "$vers"
-    automount_start "$mount_name"
-
-    echo "---"
-    info "share '$mount_name' configured. Access $MNT_DIR/$mount_name to auto-mount."
-}
-
-NM_DISPATCHER="/etc/NetworkManager/dispatcher.d/50-mounty"
-
-cmd_reconnect() {
-    local shares
-    shares=$(list_shares)
-    [[ -z "$shares" ]] && return
-
-    # Ensure credentials are available
-    if ! is_unlocked; then
-        info "vault is locked, unlocking first..."
-        cmd_unlock
-    fi
-
-    # Unmount any stale mounts
-    while IFS= read -r name; do
-        if is_mounted "$name"; then
-            sudo umount -l "$MNT_DIR/$name" 2>/dev/null || true
-        fi
-    done <<< "$shares"
-
-    # Reset and restart all automount units
-    local recovered=0
-    while IFS= read -r name; do
-        local unit
-        unit=$(automount_unit_name "$name")
-        local state result
-        state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
-        result=$(systemctl show -p Result --value "$unit" 2>/dev/null || true)
-        if [[ "$state" != "active" || "$result" != "success" ]]; then
-            sudo systemctl reset-failed "$unit" 2>/dev/null || true
-            sudo systemctl restart "$unit" 2>/dev/null || true
-            info "recovered $name"
-            (( recovered++ )) || true
-        fi
-    done <<< "$shares"
-
-    if (( recovered == 0 )); then
-        info "all automounts healthy"
-    else
-        info "$recovered share(s) recovered"
-    fi
-}
-
-cmd_install_dispatcher() {
-    local self
-    self=$(realpath "$0")
-
-    sudo tee "$NM_DISPATCHER" >/dev/null <<SCRIPT
-#!/bin/sh
-# Installed by mounty - reset failed CIFS automounts on network changes
-case "\$2" in
-    up|vpn-up|vpn-down|connectivity-change)
-        sleep 2
-        ${self} reconnect >/dev/null 2>&1 &
-        ;;
-esac
-SCRIPT
-    sudo chmod 755 "$NM_DISPATCHER"
-    info "NetworkManager dispatcher installed at $NM_DISPATCHER"
-    info "failed automounts will now recover automatically after VPN/network changes"
-}
-
-cmd_remove_dispatcher() {
-    if [[ -f "$NM_DISPATCHER" ]]; then
-        sudo rm "$NM_DISPATCHER"
-        info "NetworkManager dispatcher removed"
-    else
-        info "no dispatcher installed"
-    fi
-}
-
-cmd_help() {
-    cat <<'EOF'
+def cmd_help():
+    print("""\
 mounty - Samba/CIFS share manager
 
 Usage:
@@ -904,41 +876,55 @@ Usage:
   mounty list                List configured shares
   mounty status [name]       Show detailed share info
   mounty edit <name>         Edit share configuration
-  mounty reconnect           Reset failed automounts (e.g. after VPN)
-  mounty install-dispatcher  Auto-recover mounts on network changes
-  mounty remove-dispatcher   Remove the auto-recovery hook
+  mounty reconnect           Reset failed automounts (e.g. after VPN, resume)
+  mounty install-dispatcher  Install auto-recovery hooks (network, resume)
+  mounty remove-dispatcher   Remove the auto-recovery hooks
   mounty help                Show this help
 
 Passwords are stored in KDE Wallet. Live credentials are held in
 a tmpfs (RAM) at ~/.mounty/live/ — nothing touches disk.
 
-Shares are mounted at ~/mnt/<name> using kernel CIFS.
-EOF
-}
+Shares are mounted at ~/mnt/<name> using kernel CIFS.""")
+
 
 # --- Main ---
 
-main() {
-    local cmd="${1:-help}"
-    shift 2>/dev/null || true
+def main():
+    args = sys.argv[1:]
+    cmd  = args[0] if args else "help"
+    rest = args[1:]
 
-    case "$cmd" in
-        unlock)  cmd_unlock "$@" ;;
-        lock)    cmd_lock "$@" ;;
-        add)     cmd_add "$@" ;;
-        browse)  cmd_browse "$@" ;;
-        remove|rm)  cmd_remove "$@" ;;
-        mount)   cmd_mount "$@" ;;
-        unmount|umount) cmd_unmount "$@" ;;
-        list|ls) cmd_list "$@" ;;
-        status)  cmd_status "$@" ;;
-        edit)    cmd_edit "$@" ;;
-        reconnect)  cmd_reconnect "$@" ;;
-        install-dispatcher)  cmd_install_dispatcher "$@" ;;
-        remove-dispatcher)   cmd_remove_dispatcher "$@" ;;
-        help|-h|--help) cmd_help ;;
-        *)       die "unknown command: $cmd. Run: mounty help" ;;
-    esac
-}
+    if cmd in ("unlock",):
+        cmd_unlock()
+    elif cmd in ("lock",):
+        cmd_lock()
+    elif cmd == "add":
+        cmd_add(rest[0]) if rest else die("usage: mounty add <name>")
+    elif cmd == "browse":
+        cmd_browse(rest[0]) if rest else die("usage: mounty browse <server>")
+    elif cmd in ("remove", "rm"):
+        cmd_remove(rest[0]) if rest else die("usage: mounty remove <name>")
+    elif cmd == "mount":
+        cmd_mount(rest[0]) if rest else die("usage: mounty mount <name|--all>")
+    elif cmd in ("unmount", "umount"):
+        cmd_unmount(rest[0]) if rest else die("usage: mounty unmount <name|--all>")
+    elif cmd in ("list", "ls"):
+        cmd_list()
+    elif cmd == "status":
+        cmd_status(rest[0] if rest else "")
+    elif cmd == "edit":
+        cmd_edit(rest[0]) if rest else die("usage: mounty edit <name>")
+    elif cmd == "reconnect":
+        cmd_reconnect()
+    elif cmd == "install-dispatcher":
+        cmd_install_dispatcher()
+    elif cmd == "remove-dispatcher":
+        cmd_remove_dispatcher()
+    elif cmd in ("help", "-h", "--help"):
+        cmd_help()
+    else:
+        die(f"unknown command: {cmd}. Run: mounty help")
 
-main "$@"
+
+if __name__ == "__main__":
+    main()
